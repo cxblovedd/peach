@@ -79284,21 +79284,47 @@ function TRe(e, t, n) {
 		} : {},
 		rate: (e) => g(`rate:${e}`, "评分", async () => {
 			let n = f().rating || 0, r = Ife(n, e);
-			await _("rate", r), t.toast(r ? `已评 ${AD(r)} 星` : "已取消评分", { undo: async () => {
+			p({ rating: r || null });
+			try {
+				await _("rate", r);
+			} catch (e) {
+				throw p({ rating: n || null }), e;
+			}
+			t.toast(r ? `已评 ${AD(r)} 星` : "已取消评分", { undo: async () => {
 				await _("rate", n);
 			} });
 		}),
 		feedback: (e) => g(e, "操作", async () => {
-			let n = { feedback: f().feedback || null }, r = await _(e);
-			t.toast(Qfe(e, r), { undo: async () => {
-				e === "o" ? await _("o-undo") : e === "dispose" ? await _("dispose") : (r.feedback && await _(r.feedback), n.feedback && await _(n.feedback)), await t.trashChanged(f().disposal || null, !0);
-			} }), e === "dispose" && await t.trashChanged(r.disposal || null, !1);
+			let n = {
+				feedback: f().feedback || null,
+				disposal: f().disposal || null,
+				o_count: f().o_count || 0
+			};
+			e === "dislike" ? p({ feedback: n.feedback === "dislike" ? void 0 : "dislike" }) : e === "seen" ? p({ feedback: n.feedback === "seen" ? void 0 : "seen" }) : e === "dispose" ? p({ disposal: n.disposal === "trash" ? void 0 : "trash" }) : e === "o" && p({ o_count: n.o_count + 1 });
+			try {
+				let r = await _(e);
+				t.toast(Qfe(e, r), { undo: async () => {
+					e === "o" ? await _("o-undo") : e === "dispose" ? await _("dispose") : (r.feedback && await _(r.feedback), n.feedback && await _(n.feedback)), await t.trashChanged(f().disposal || null, !0);
+				} }), e === "dispose" && await t.trashChanged(r.disposal || null, !1);
+			} catch (e) {
+				throw p({
+					feedback: n.feedback ?? void 0,
+					disposal: n.disposal ?? void 0,
+					o_count: n.o_count
+				}), e;
+			}
 		}),
 		later: () => g("later", "更新稍后看", async () => {
-			let e = await m(Tfe, {});
-			p({ watch_later: e.watch_later }), t.toast(e.watch_later ? "已加入稍后看" : "已移出稍后看", { undo: async () => {
-				p({ watch_later: (await m(Tfe, {})).watch_later });
-			} });
+			let e = !!f().watch_later;
+			p({ watch_later: !e });
+			try {
+				let e = await m(Tfe, {});
+				p({ watch_later: e.watch_later }), t.toast(e.watch_later ? "已加入稍后看" : "已移出稍后看", { undo: async () => {
+					p({ watch_later: (await m(Tfe, {})).watch_later });
+				} });
+			} catch (t) {
+				throw p({ watch_later: e }), t;
+			}
 		}),
 		quality: () => g("quality", "更新版本需求", async () => {
 			let e = {
@@ -79307,10 +79333,22 @@ function TRe(e, t, n) {
 			}, n = (e) => p({
 				better_version: e.better_version,
 				better_version_reason: e.better_version_reason || ""
-			}), r = await m(Efe, { wanted: !e.wanted });
-			n(r), t.toast(r.better_version ? "已标记寻找更好版本" : "已取消寻找更好版本", { undo: async () => {
-				n(await m(Efe, e));
-			} });
+			});
+			n({
+				better_version: !e.wanted,
+				better_version_reason: e.reason
+			});
+			try {
+				let r = await m(Efe, { wanted: !e.wanted });
+				n(r), t.toast(r.better_version ? "已标记寻找更好版本" : "已取消寻找更好版本", { undo: async () => {
+					n(await m(Efe, e));
+				} });
+			} catch (t) {
+				throw n({
+					better_version: e.wanted,
+					better_version_reason: e.reason
+				}), t;
+			}
 		}),
 		preference: ({ liked: e, reason: n }) => {
 			g(e === void 0 ? "preference" : "like", "保存喜欢偏好", async () => {
@@ -79321,14 +79359,17 @@ function TRe(e, t, n) {
 					liked: e.liked,
 					like_reason: e.like_reason || ""
 				});
-				u("保存中…");
+				o({
+					liked: a,
+					like_reason: i
+				}), u("保存中…");
 				try {
 					o(await m(Dfe, {
 						liked: a,
 						reason: i
 					}));
 				} catch (e) {
-					throw u("保存失败 · 请重试"), e;
+					throw o(r), u("保存失败 · 请重试"), e;
 				}
 				u("已保存"), setTimeout(() => u((e) => e === "已保存" ? "" : e), 1400);
 				let s = f();
@@ -109221,6 +109262,8 @@ function vgt(e, t) {
 	e.edition_group ? o_t(e.edition_group.seed_id, e.id, !0, t) : e.part_group ? s_t(e.part_group.seed_id, e.id, !0, t) : v9(e.id, !0, null, t);
 }
 async function ygt(e, t) {
+	let n = !!e.watch_later, r = !n;
+	e.watch_later = r, t(r);
 	try {
 		let n = await Lt("/api/watch-later", {
 			method: "POST",
@@ -109233,8 +109276,8 @@ async function ygt(e, t) {
 			});
 			e.watch_later = n.watch_later, t(!!n.watch_later);
 		} });
-	} catch (e) {
-		K5.actionFailure("更新稍后看", e);
+	} catch (r) {
+		e.watch_later = n, t(n), K5.actionFailure("更新稍后看", r);
 	}
 }
 async function bgt(e, t) {

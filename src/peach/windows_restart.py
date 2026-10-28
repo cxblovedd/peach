@@ -147,6 +147,15 @@ def _command_lines(process_ids: Iterable[int] = ()) -> dict[int, str]:
     return lines
 
 
+def _ensure_default_desktop(user32) -> None:
+    try:
+        hdesk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
+
+
 def find_source_tray_windows() -> tuple[TrayWindow, ...]:
     """源码形态的托盘：`pythonw -c …peach.tray…` 拉起的托盘窗口。
 
@@ -162,6 +171,7 @@ def find_source_tray_windows() -> tuple[TrayWindow, ...]:
     if os.name != "nt":
         return ()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _ensure_default_desktop(user32)
     paths, _parents = _process_paths_and_parents()
     candidates: list[TrayWindow] = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -252,6 +262,7 @@ def find_tray_windows(target: Path) -> tuple[TrayWindow, ...]:
     if os.name != "nt":
         return ()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _ensure_default_desktop(user32)
     paths, _parents = _process_paths_and_parents()
     target_key = _normal_path(target)
     found: list[TrayWindow] = []

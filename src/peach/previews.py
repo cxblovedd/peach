@@ -491,7 +491,7 @@ class DerivedImageService:
                     # `thumbnail` 只缩不放：本来就比这一档小的图原样重编码，不上采样。
                     image.thumbnail((self.edge, self.edge), Image.LANCZOS)
                     image.save(temporary, ENTITY_THUMB_FORMAT,
-                               quality=self.quality, method=4)
+                               quality=self.quality, method=2)
         except (OSError, ValueError, Image.DecompressionBombError,
                 Image.UnidentifiedImageError):
             return None
