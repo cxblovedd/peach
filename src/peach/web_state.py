@@ -177,7 +177,8 @@ class WebContract:
         self.keyed_cache: OrderedDict[str, tuple[float, object]] = OrderedDict()
         #: 每次 cache_bust 递增。在途计算据此判断自己出发后缓存是否失效过。
         self.cache_generation = 0
-        self.revision_cache_keys: set[str] = set()
+        #: 磁盘目录索引（自带目录版本核验）在 commit 与 cache_bust 时保留，不反复重扫全盘。
+        self.revision_cache_keys: set[str] = {"cover-index", "logo-index", "avatar-root-index"}
         self.aggregate_locks: dict[str, threading.RLock] = {}
         self.follow_check_lock = threading.Lock()
         #: 任务中心。每个后台任务的开始、进度与结束都写这一张表，`/tasks` 只读它。

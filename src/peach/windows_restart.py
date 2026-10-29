@@ -144,7 +144,33 @@ def _command_lines(process_ids: Iterable[int] = ()) -> dict[int, str]:
             lines[int(pid_text)] = command
         except ValueError:
             continue
+    try:
+        from .config import STATE_DIR
+        watchdogs = STATE_DIR / "tray-watchdogs"
+        if watchdogs.is_dir():
+            import json
+            for record in watchdogs.glob("*.json"):
+                try:
+                    payload = json.loads(record.read_text(encoding="utf-8"))
+                    pid = payload.get("pid")
+                    if pid and (not wanted or pid in wanted) and not lines.get(pid):
+                        argv = payload.get("argv")
+                        if argv and isinstance(argv, list):
+                            lines[pid] = subprocess.list2cmdline(argv)
+                except Exception:
+                    pass
+    except Exception:
+        pass
     return lines
+
+
+def _ensure_default_desktop(user32) -> None:
+    try:
+        hdesk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if hdesk:
+            user32.SetThreadDesktop(hdesk)
+    except Exception:
+        pass
 
 
 def find_source_tray_windows() -> tuple[TrayWindow, ...]:
@@ -162,6 +188,7 @@ def find_source_tray_windows() -> tuple[TrayWindow, ...]:
     if os.name != "nt":
         return ()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _ensure_default_desktop(user32)
     paths, _parents = _process_paths_and_parents()
     candidates: list[TrayWindow] = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -180,7 +207,7 @@ def find_source_tray_windows() -> tuple[TrayWindow, ...]:
         user32.GetClassNameW(window, buffer, len(buffer))
         class_name = buffer.value
         if (class_name.startswith("Peach") and class_name.endswith("SystemTrayIcon")
-                and image.lower().endswith("pythonw.exe")):
+                and image.lower().endswith(("pythonw.exe", "python.exe"))):
             candidates.append(TrayWindow(process_id, int(window)))
         return True
 
@@ -252,6 +279,7 @@ def find_tray_windows(target: Path) -> tuple[TrayWindow, ...]:
     if os.name != "nt":
         return ()
     user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _ensure_default_desktop(user32)
     paths, _parents = _process_paths_and_parents()
     target_key = _normal_path(target)
     found: list[TrayWindow] = []

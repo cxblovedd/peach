@@ -690,44 +690,86 @@ function useDetailWrite(item: DetailItem, actions: ItemDetailActions, label: (ta
     rate: (star: number) => start(`rate:${star}`, '评分', async () => {
       const before = current().rating || 0;
       const value = nextRating(before, star);
-      await sendFeedback('rate', value);
+      apply({ rating: value || null });
+      try {
+        await sendFeedback('rate', value);
+      } catch (error) {
+        apply({ rating: before || null });
+        throw error;
+      }
       actions.toast(value ? `已评 ${ratingStars(value)} 星` : '已取消评分', { undo: async () => { await sendFeedback('rate', before) } });
     }),
 
     feedback: (kind: string) => start(kind, '操作', async () => {
-      const before = { feedback: current().feedback || null };
-      const result = await sendFeedback(kind);
-      actions.toast(feedbackReceipt(kind, result), {
-        undo: async () => {
-          if (kind === 'o') await sendFeedback('o-undo');
-          else if (kind === 'dispose') await sendFeedback('dispose');
-          else {
-            if (result.feedback) await sendFeedback(result.feedback);
-            if (before.feedback) await sendFeedback(before.feedback);
-          }
-          await actions.trashChanged(current().disposal || null, true);
-        },
-      });
-      if (kind === 'dispose') await actions.trashChanged(result.disposal || null, false);
+      const before = {
+        feedback: current().feedback || null,
+        disposal: current().disposal || null,
+        o_count: current().o_count || 0,
+      };
+      if (kind === 'dislike') {
+        apply({ feedback: before.feedback === 'dislike' ? undefined : 'dislike' });
+      } else if (kind === 'seen') {
+        apply({ feedback: before.feedback === 'seen' ? undefined : 'seen' });
+      } else if (kind === 'dispose') {
+        apply({ disposal: before.disposal === 'trash' ? undefined : 'trash' });
+      } else if (kind === 'o') {
+        apply({ o_count: before.o_count + 1 });
+      }
+      try {
+        const result = await sendFeedback(kind);
+        actions.toast(feedbackReceipt(kind, result), {
+          undo: async () => {
+            if (kind === 'o') await sendFeedback('o-undo');
+            else if (kind === 'dispose') await sendFeedback('dispose');
+            else {
+              if (result.feedback) await sendFeedback(result.feedback);
+              if (before.feedback) await sendFeedback(before.feedback);
+            }
+            await actions.trashChanged(current().disposal || null, true);
+          },
+        });
+        if (kind === 'dispose') await actions.trashChanged(result.disposal || null, false);
+      } catch (error) {
+        apply({
+          feedback: before.feedback ?? undefined,
+          disposal: before.disposal ?? undefined,
+          o_count: before.o_count,
+        });
+        throw error;
+      }
     }),
 
     later: () => start('later', '更新稍后看', async () => {
-      const result = await post<{ watch_later: boolean }>(WATCH_LATER_URL, {});
-      apply({ watch_later: result.watch_later });
-      actions.toast(result.watch_later ? '已加入稍后看' : '已移出稍后看', {
-        undo: async () => { apply({ watch_later: (await post<{ watch_later: boolean }>(WATCH_LATER_URL, {})).watch_later }) },
-      });
+      const before = !!current().watch_later;
+      const next = !before;
+      apply({ watch_later: next });
+      try {
+        const result = await post<{ watch_later: boolean }>(WATCH_LATER_URL, {});
+        apply({ watch_later: result.watch_later });
+        actions.toast(result.watch_later ? '已加入稍后看' : '已移出稍后看', {
+          undo: async () => { apply({ watch_later: (await post<{ watch_later: boolean }>(WATCH_LATER_URL, {})).watch_later }) },
+        });
+      } catch (error) {
+        apply({ watch_later: before });
+        throw error;
+      }
     }),
 
     quality: () => start('quality', '更新版本需求', async () => {
       const before = { wanted: !!current().better_version, reason: current().better_version_reason || '' };
       type Goal = { better_version: boolean; better_version_reason?: string };
       const paint = (goal: Goal) => apply({ better_version: goal.better_version, better_version_reason: goal.better_version_reason || '' });
-      const result = await post<Goal>(QUALITY_GOAL_URL, { wanted: !before.wanted });
-      paint(result);
-      actions.toast(result.better_version ? '已标记寻找更好版本' : '已取消寻找更好版本', {
-        undo: async () => { paint(await post<Goal>(QUALITY_GOAL_URL, before)) },
-      });
+      paint({ better_version: !before.wanted, better_version_reason: before.reason });
+      try {
+        const result = await post<Goal>(QUALITY_GOAL_URL, { wanted: !before.wanted });
+        paint(result);
+        actions.toast(result.better_version ? '已标记寻找更好版本' : '已取消寻找更好版本', {
+          undo: async () => { paint(await post<Goal>(QUALITY_GOAL_URL, before)) },
+        });
+      } catch (error) {
+        paint({ better_version: before.wanted, better_version_reason: before.reason });
+        throw error;
+      }
     }),
 
     /* 喜欢与理由是同一条偏好：点喜欢键只改 `liked`，提交理由时有字就算喜欢。 */
@@ -739,10 +781,12 @@ function useDetailWrite(item: DetailItem, actions: ItemDetailActions, label: (ta
         const wanted = liked ?? (before.liked || text.trim().length > 0);
         type Preference = { liked: boolean; like_reason?: string };
         const paint = (result: Preference) => apply({ liked: result.liked, like_reason: result.like_reason || '' });
+        paint({ liked: wanted, like_reason: text });
         setPreferenceState('保存中…');
         try {
           paint(await post<Preference>(PREFERENCE_URL, { liked: wanted, reason: text }));
         } catch (error) {
+          paint(before);
           setPreferenceState('保存失败 · 请重试');
           throw error;
         }

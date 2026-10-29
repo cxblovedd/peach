@@ -63,10 +63,34 @@ class _Probe:
     pending: Future | None = None
 
 
+
+def probe_mount(path: Path) -> str:
+    """挂载探测：Windows 本地驱动器以驱动器挂载表判定，避免周期心跳唤醒休眠外接盘。"""
+    import sys
+    from .platform import is_windows_path
+    if sys.platform == "win32":
+        raw = str(path)
+        if is_windows_path(raw):
+            import ctypes
+            from pathlib import PureWindowsPath
+            drive = PureWindowsPath(raw).drive + "\\"
+            drive_type = ctypes.windll.kernel32.GetDriveTypeW(drive)
+            if drive_type in (2, 3, 6):
+                return "ok"
+            if drive_type == 1:
+                return "missing"
+    return root_status(path)
+
+
+def mount_online(path: Path) -> bool:
+    """确认挂载是否在线；Windows 本地物理盘零 I/O 检查。"""
+    return probe_mount(path) == "ok"
+
+
 class MountReachability:
     """正常十分钟、异常一分钟；一次否定结果隔一秒复查后才确认故障。"""
 
-    def __init__(self, roots, *, probe=root_status, clock=time.monotonic,
+    def __init__(self, roots, *, probe=probe_mount, clock=time.monotonic,
                  wall_clock=time.time, retry_delay=1.0, timeout=PROBE_TIMEOUT):
         self.roots = tuple(roots)
         self.probe, self.clock, self.wall_clock = probe, clock, wall_clock

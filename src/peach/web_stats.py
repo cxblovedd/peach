@@ -21,7 +21,12 @@ from .catalog_rules import tag_cat
 from . import media_libraries, settings_file
 from .config import LOCATION_ROOT_DECLARATIONS
 from .fsutil import atomic_write_text
-from .platform import is_unmapped, root_online, system_volume, translate_ledger_path
+from .platform import is_unmapped, system_volume, translate_ledger_path
+
+
+def root_online(root: Path) -> bool:
+    from .mount_reachability import mount_online
+    return mount_online(root)
 from .taste_history import (
     analyze_history,
     build_taste_dashboard,
