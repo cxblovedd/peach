@@ -50,6 +50,9 @@ GROUP_TABLES = ('asset', 'asset_entity', 'entity')
 #: 由界面显示「等 N 人」。详情页走 q_item，不受这个上限影响。
 CARD_PERFORMERS = 6
 
+#: 相关推荐的候选池上限。从共有实体降序截取前段，避免深层低相关作品拉长 MMR 计算耗时。
+RELATED_CANDIDATE_POOL = 200
+
 
 def attach_artwork_fields(contract: WebContract, item: dict) -> None:
     """列表、详情与推荐共用本地官方封面和版本投影。"""
@@ -692,7 +695,31 @@ def _catalog_group_rows(contract: WebContract) -> list[dict]:
                                         tables=GROUP_TABLES)
 
 
+def _catalog_group_structural_fingerprint(contract: WebContract) -> tuple | None:
+    """计算影响分卷、版本与作品归组的资产结构指纹。
+
+    评分、喜好、稍后看、播放进度等非结构字段变动不改变归组，指纹不变时直接复用解析快照。
+    """
+    try:
+        with contract.read_connection() as connection:
+            tag_rev = contract.ledger_revision(('asset_entity', 'entity'))
+            row = connection.execute(
+                "SELECT count(*), total(id), total(size), total(duration), "
+                "total(length(name)), total(length(code)), total(length(path)), "
+                "total(CASE WHEN disposal IS NULL THEN 0 ELSE 1 END) "
+                "FROM asset WHERE medium='video' AND COALESCE(disposal,'')<>'vanished'"
+            ).fetchone()
+            return (tag_rev, *row)
+    except Exception:
+        return None
+
+
 def _read_group_rows(contract: WebContract) -> list[dict]:
+    fp = _catalog_group_structural_fingerprint(contract)
+    cached = getattr(contract, '_group_rows_cache', None)
+    if fp is not None and cached is not None and cached[0] == fp:
+        return cached[1]
+
     with contract.read_connection() as connection:
         rows = [dict(row) for row in connection.execute(
             "SELECT id,name,path,code,size,duration,width,height,ctx_orient,disposal,catalog_title,field_owners "
@@ -701,6 +728,8 @@ def _read_group_rows(contract: WebContract) -> list[dict]:
             "AND COALESCE(disposal,'')<>'vanished' AND NOT peach_is_local_extra(name,path) ORDER BY id",
         )]
         if not rows:
+            if fp is not None:
+                contract._group_rows_cache = (fp, [])
             return []
         # 版次判据同时看文件名和标签（`无码` 可能只登记在标签上），所以标签要一起取。
         tags: dict[int, list[str]] = {}
@@ -717,6 +746,8 @@ def _read_group_rows(contract: WebContract) -> list[dict]:
             continue
         row["edition"] = _edition_label(row, tuple(tags.get(int(row["id"]), ())))
         coded.append(row)
+    if fp is not None:
+        contract._group_rows_cache = (fp, coded)
     return coded
 
 
@@ -729,6 +760,11 @@ def _edition_groups(contract: WebContract, codes) -> dict[str, list[dict]]:
 
 
 def _derive_edition_groups(contract: WebContract) -> dict[str, list[dict]]:
+    fp = _catalog_group_structural_fingerprint(contract)
+    cached = getattr(contract, '_edition_groups_cache', None)
+    if fp is not None and cached is not None and cached[0] == fp:
+        return cached[1]
+
     candidates: dict[str, list[dict]] = {}
     for row in _catalog_group_rows(contract):
         if row.get('disposal') is None:
@@ -747,6 +783,8 @@ def _derive_edition_groups(contract: WebContract) -> dict[str, list[dict]]:
         groups[code] = [dict(row, version_id=version['id'], version_label=label,
                              version_multipart=version['multipart'])
                         for version, label in zip(versions, labels) for row in version['items']]
+    if fp is not None:
+        contract._edition_groups_cache = (fp, groups)
     return groups
 
 
@@ -816,6 +854,11 @@ def multipart_groups(contract: WebContract) -> dict[str, list[dict]]:
     （`_live_parts`）。裸名首卷没有标记，由 `ordered_multipart_items` 定夺。
     """
     def derive():
+        fp = _catalog_group_structural_fingerprint(contract)
+        cached = getattr(contract, '_multipart_groups_cache', None)
+        if fp is not None and cached is not None and cached[0] == fp:
+            return cached[1]
+
         candidates: dict[str, list[dict]] = {}
         for row in _catalog_group_rows(contract):
             code = normalise_code_key(row['code'])
@@ -830,6 +873,8 @@ def multipart_groups(contract: WebContract) -> dict[str, list[dict]]:
                 if version['multipart']:
                     key = code if len(versions) == 1 else f"{code}:{version['id']}"
                     groups[key] = version['items']
+        if fp is not None:
+            contract._multipart_groups_cache = (fp, groups)
         return groups
     return contract.cached_until_changed("catalog-multipart-groups", derive, tables=GROUP_TABLES)
 
@@ -843,12 +888,19 @@ def _live_parts(group) -> list[dict]:
 def video_work_key(contract: WebContract, connection) -> str:
     """分卷与版本按一部作品计数，其余文件各自计数。"""
     def derive():
+        fp = _catalog_group_structural_fingerprint(contract)
+        cached = getattr(contract, '_video_work_key_cache', None)
+        if fp is not None and cached is not None and cached[0] == fp:
+            return cached[1]
+
         editions = _edition_groups(contract, [row['code'] for row in _catalog_group_rows(contract)])
         keys = {int(item['id']): f"edition:{int(group[0]['id'])}"
                 for group in editions.values() for item in group}
         for group in multipart_groups(contract).values():
             for item in group:
                 keys.setdefault(int(item['id']), f"multipart:{int(group[0]['id'])}")
+        if fp is not None:
+            contract._video_work_key_cache = (fp, keys)
         return keys
     keys = contract.cached_until_changed('catalog-video-work-key', derive, tables=GROUP_TABLES)
     connection.create_function('peach_video_work_key', 1,
@@ -916,9 +968,19 @@ def q_parts(contract: WebContract, args):
 
 
 def _parts_by_asset(contract: WebContract) -> dict[int, tuple[str, list[dict]]]:
-    return contract.cached_until_changed('catalog-parts-by-asset', lambda: {
-        int(row['id']): (key, group) for key, group in multipart_groups(contract).items() for row in group},
-        tables=GROUP_TABLES)
+    def derive():
+        fp = _catalog_group_structural_fingerprint(contract)
+        cached = getattr(contract, '_parts_by_asset_cache', None)
+        if fp is not None and cached is not None and cached[0] == fp:
+            return cached[1]
+        parts = {
+            int(row['id']): (key, group)
+            for key, group in multipart_groups(contract).items() for row in group
+        }
+        if fp is not None:
+            contract._parts_by_asset_cache = (fp, parts)
+        return parts
+    return contract.cached_until_changed('catalog-parts-by-asset', derive, tables=GROUP_TABLES)
 
 
 def _part_labels(group: list[dict]) -> dict[int, str]:
@@ -1130,6 +1192,7 @@ def q_related(contract: WebContract, aid, limit=24):
                 "ctx_orient,snapshot_path,play_count,leave_ratio,feedback,disposal,o_count")
         source_entity_ids = [row[0] for row in source_entities]
         source_marks = ",".join("?" * len(source_entity_ids))
+        pool_limit = max(int(limit) * 10, RELATED_CANDIDATE_POOL)
         candidate_rows = [dict(row) for row in c.execute(
             f"SELECT {COLS},a.release_date,a.region,"
             f"{EFFECTIVE_REGION_SQL} AS effective_region "
@@ -1138,7 +1201,7 @@ def q_related(contract: WebContract, aid, limit=24):
             "AND (a.feedback IS NULL OR a.feedback<>'dislike') AND a.disposal IS NULL "
             "AND NOT peach_is_local_extra(a.name,a.path) "
             f"AND shared.entity_id IN ({source_marks}) GROUP BY a.id "
-            "ORDER BY count(DISTINCT shared.entity_id) DESC,a.id LIMIT 4000",
+            f"ORDER BY count(DISTINCT shared.entity_id) DESC,a.id LIMIT {pool_limit}",
             (aid, *source_entity_ids),
         )]
         candidate_rows = _one_card_per_release(

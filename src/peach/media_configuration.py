@@ -87,7 +87,10 @@ def _online(root, mount, probe, config):
         return False
     from .smb_media import resolve
     resource = resolve(root, config)
-    return platform.root_online(resource if resource is not None else Path(mount))
+    if resource is not None:
+        return platform.root_online(resource)
+    from .mount_reachability import mount_online
+    return mount_online(Path(mount))
 
 
 def _automatic_root(location: str, path: str, used: list[PureWindowsPath]) -> str:
