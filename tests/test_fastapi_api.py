@@ -115,7 +115,8 @@ CREATE TABLE entity_membership(
 CREATE TABLE label_maker(
   label_id INTEGER PRIMARY KEY,maker_id INTEGER,source TEXT,
   confidence REAL DEFAULT 1.0,checked_at TEXT);
-CREATE TABLE performer_profile(entity_id INTEGER PRIMARY KEY,source TEXT);
+CREATE TABLE performer_profile(entity_id INTEGER PRIMARY KEY,source TEXT,
+  raw_json TEXT DEFAULT '{}',tags_json TEXT DEFAULT '[]',source_url TEXT DEFAULT '');
 CREATE TABLE watch_queue(profile_id TEXT,asset_id INTEGER,added_at TEXT,source TEXT,
   PRIMARY KEY(profile_id,asset_id));
 CREATE TABLE playlist(
@@ -573,6 +574,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             # `detail` 是诊断串，界面要展示的是 `message`；缺了它前端只能显示内部原话。
             self.assertEqual(body["detail"], "写入端是 mac")
             self.assertIn("只能浏览", body["message"])
+
+            name_settings = await client.post(
+                '/api/settings?t=secret', json={'performerNameLanguage': 'ja'},
+            )
+            self.assertEqual(name_settings.status_code, 409)
+            self.assertEqual(name_settings.json()['error'], 'ledger read-only')
 
     async def test_replication_off_runs_as_a_standalone_writer(self):
         """`replication.enabled = false` 时没有 sync 对象（ADR-0023 第 3 阶段）。
@@ -2276,7 +2283,12 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
             connection.execute("INSERT INTO performer_profile(entity_id,source) VALUES(901,'test')")
             connection.execute(
                 "INSERT INTO entity_alias VALUES(901,'</script><script>演示','alias','test',1)")
-        shapes = (await self.client.get('/api/entity/shapes')).json()['entities']
+        projection = (await self.client.get('/api/entity/shapes')).json()
+        self.assertTrue(projection['ok'])
+        self.assertEqual(projection['name_variants'], [])
+        self.assertEqual(projection['name_glyphs']['寧'], '宁')
+        self.assertEqual(projection['name_glyphs']['鈴'], '铃')
+        shapes = projection['entities']
         by_id = {shape['id']: shape for shape in shapes}
         for entity_id in (901, 902):
             for method in ('GET', 'HEAD'):
@@ -2309,6 +2321,34 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(json.loads(payload), runtime)
                 self.assertNotIn('<script>', payload)
                 self.assertEqual(response.headers['cache-control'], 'no-store')
+
+    async def test_tutorial_entry_first_frame_uses_shared_ledger_completion(self):
+        from html.parser import HTMLParser
+        from peach.web_tutorial import CAMPAIGN
+
+        class Buttons(HTMLParser):
+            entry = None
+
+            def handle_starttag(self, tag, attrs):
+                attributes = dict(attrs)
+                if tag == 'button' and attributes.get('id') == 'tutorialBtn':
+                    self.entry = attributes
+
+        self.page.write_text('<html><head></head><body><button id="tutorialBtn">教程</button></body></html>',
+                             encoding='utf-8')
+        await self.client.post('/login', content='token=secret&next=%2F',
+                               headers={'Content-Type': 'application/x-www-form-urlencoded'})
+        for action, hidden in ((None, False), ('complete', True), ('reopen', False)):
+            if action:
+                result = await self.client.post('/api/tutorial-progress', json={'campaign': CAMPAIGN, 'action': action})
+                self.assertEqual(result.status_code, 200, result.text)
+            for path in ('/', '/settings/library'):
+                response = await self.client.get(path)
+                self.assertEqual(response.status_code, 200, response.text)
+                parsed = Buttons()
+                parsed.feed(response.text)
+                self.assertIsNotNone(parsed.entry)
+                self.assertEqual('hidden' in parsed.entry, hidden)
 
     async def test_canonical_page_urls_require_authentication(self):
         for path in ('/assets/1', '/posts/1', '/works/ABC-001', '/performers/1',
@@ -3833,6 +3873,10 @@ class UnconfiguredMachineTests(unittest.IsolatedAsyncioTestCase):
                         ready = await client.get("/healthz?ready=1")
                         self.assertEqual(ready.status_code, 503)
                         self.assertFalse(ready.json()["ready"])
+                        for path in ('/', '/settings/library'):
+                            page = await client.get(path)
+                            self.assertEqual(page.status_code, 200)
+                            self.assertIn('id="tutorialBtn"', page.text)
                 self.assertEqual([record.levelname for record in captured.records], ["WARNING"])
                 self.assertIn("数据库准备完成后重启服务", captured.output[0])
                 self.assertNotIn(str(database), captured.output[0])

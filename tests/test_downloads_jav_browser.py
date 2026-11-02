@@ -165,7 +165,7 @@ class BrowserTests(unittest.TestCase):
         with contract.database.write_transaction() as connection:
             asset_id = connection.execute(
                 'INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)',
-                ('R:\Media\ABC-123.mp4', 'ABC-123.mp4', 'local', 'video', 'ABC-123')).lastrowid
+                (r'R:\Media\ABC-123.mp4', 'ABC-123.mp4', 'local', 'video', 'ABC-123')).lastrowid
             person = upsert_asset_entity(connection, asset_id=asset_id, kind='performer', name='测试演员',
                                          role='performer', source='user:test')
         contract.avatar_root.mkdir(parents=True, exist_ok=True)
@@ -646,6 +646,37 @@ class BrowserTests(unittest.TestCase):
         self.assertFalse(self.service.rows)
         self.service.search.assert_not_called()
         self.remote.submit.assert_not_called()
+
+    def test_mgstage_store_prefix_finds_the_owned_plain_release(self):
+        source = "https://www.mgstage.com/product/product_detail/107STZY-019/"
+        with self.app.state.web_contract.database.write_transaction() as connection:
+            connection.execute("INSERT INTO asset(path,name,location,medium,code) VALUES(?,?,?,?,?)",
+                               ("R:\\Media\\STZY-019.mp4", "STZY-019.mp4", "local", "video", "STZY-019"))
+        result = self.client.get("/api/jav-browser/identify", headers=self.script_headers,
+                                 params={"source_url": source, "code": "107STZY-019"})
+        self.assertEqual(result.status_code, 200, result.text)
+        self.assertEqual((result.json()["code"], result.json()["state"]), ("STZY-019", "owned"))
+        self.assertEqual(self.add("107STZY-019").json()["state"], "owned")
+        self.assertFalse(self.service.process_one())
+        self.service.search.assert_not_called()
+
+    def test_mgstage_store_prefix_searches_and_submits_the_plain_release(self):
+        self.service.search.return_value = {"items": [{"name": "STZY-019 1080p", "uri": MAGNET}]}
+        self.assertEqual(self.add("107STZY-019").json()["code"], "STZY-019")
+        self.service.process_one()
+        self.assertEqual(self.service.rows["STZY-019"]["state"], "submitted")
+        self.service.search.assert_called_once_with(self.app.state.web_contract, {"code": "STZY-019", "goal": "quality"})
+        self.assertEqual(self.downloads.store.get(self.service.rows["STZY-019"]["task_id"]).code, "STZY-019")
+
+    def test_queue_rows_saved_under_a_store_prefix_move_to_the_plain_release(self):
+        self.service.path.parent.mkdir(parents=True, exist_ok=True)
+        self.service.path.write_text(json.dumps({
+            "107STZY-019": {"state": "no_match", "provider": "115", "source_url": ""},
+            "107STARS-325": {"state": "no_match", "provider": "115", "source_url": ""},
+            "STARS-325": {"state": "queued", "provider": "115", "source_url": ""}}), encoding="utf-8")
+        restored = JavBrowser(self.app.state.web_contract, search=self.service.search)
+        self.assertEqual({key: row["state"] for key, row in restored.rows.items()},
+                         {"STZY-019": "no_match", "STARS-325": "queued"})
 
     def test_explicit_product_suffix_is_preserved_through_the_download_submission(self):
         code = "104DANDY-851C"
