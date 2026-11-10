@@ -800,8 +800,6 @@ function useDetailWrite(item: DetailItem, actions: ItemDetailActions, label: (ta
           setPreferenceState(t('catalog:detailFeedback.saveFailed'));
           throw error;
         }
-          throw error;
-        }
         const savedText = t('catalog:shared.saved');
         setPreferenceState(savedText);
         setTimeout(() => setPreferenceState((now) => (now === savedText ? '' : now)), 1400);
