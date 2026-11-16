@@ -1,6 +1,7 @@
 import { cleanTagFilter, isCatalogPath, ROUTE_STATES, STATE_ROUTES } from '@peach/legacy/core';
 import type { BarsContext, CatalogFilters } from '@peach/shell';
 
+import { lengthParam, orientParam } from '../../core/stored-values';
 import { defaultSortDir, preferredDirection, sortFromAddress } from '../../sort-preferences';
 
 export interface CatalogPreferences {
@@ -40,8 +41,8 @@ export function initialCatalogFilters(address: CatalogAddress, preferences: Cata
   return {
     loc: params.get('loc') ?? 'local,115', creator: read('creator') || '', studio: read('studio') || '',
     owner: read('owner') === 'none' ? 'none' : '', tag: cleanTagFilter(read('tag')),
-    tag_match: read('tag_match') === 'any' ? 'any' : 'all', len: read('len') || '',
-    dur_min: read('dur_min') || '', dur_max: read('dur_max') || '', orient: read('orient') || '',
+    tag_match: read('tag_match') === 'any' ? 'any' : 'all', len: lengthParam(read('len')),
+    dur_min: read('dur_min') || '', dur_max: read('dur_max') || '', orient: orientParam(read('orient')),
     region: read('region') || '', year: read('year') || '', state: ROUTE_STATES[pathname] || read('state') || '',
     ...resolveSort(read('sort'), read('dir'), preferences), seed: read('seed') || seed(),
     q: read('q') || '', jav: read('jav') || '', thumb: read('thumb') || '0',
@@ -91,4 +92,14 @@ export function homeCatalogState<T extends CatalogFilters>(state: T): {
   state: T; barsContext: BarsContext; detailReturnBarsContext: null;
 } {
   return { state, barsContext: { type: 'home', filters: state }, detailReturnBarsContext: null };
+}
+
+/** 首页的竖屏放哪儿。`homeDefault` 是首页默认列表（没有搜索、没有显式筛画幅），那里竖屏由独立的竖屏带承接、
+ *  主网格排除竖屏；`stripAllowed` 是这一屏能插竖屏带。设置里把竖屏带关掉（`shortsLimit` 为 0）时两样一起撤：
+ *  不插带子，竖屏回到主网格里。JAV 模式（`javOnly`）恒不含竖屏，不看这个开关。 */
+export function verticalRouting({ homeDefault, javOnly, stripAllowed, shortsLimit }: {
+  homeDefault: boolean; javOnly: boolean; stripAllowed: boolean; shortsLimit: number;
+}): { excludeVertical: boolean; shorts: boolean; shortsLimit: number } {
+  const strip = shortsLimit > 0;
+  return { excludeVertical: (homeDefault && strip) || javOnly, shorts: stripAllowed && strip, shortsLimit };
 }

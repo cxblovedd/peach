@@ -156,6 +156,8 @@ GitGud 的 Linux 平台 Runner 不提供 Docker 守护进程，Docker 镜像由 
 
 GitHub 发版时，`release.yml` 的 `r2-mirror` 作业在 Release 公开后下载它的制品、`SHA256SUMS.txt` 与签名，交给 `scripts/release_r2.py` 原样上传到 R2，逐个从 `https://downloads.peach.video` 完整下载核对后改写 `releases.json`。凭据用 `release` environment 里与 Sparkle appcast 相同的 R2 secret 和变量。镜像只留最新三个版本：新版本登记进索引后删除更老的版本目录，GitHub 上的同版本制品不受影响；比保留版本还旧的版本拒绝上传。连不上 GitHub 的客户端靠这份索引更新，作业失败时它们停在上一个镜像版本，重跑这个作业即可。
 
+GitGud 只做备份，不跑验收。`gitgud-mirror.yml` 在 master 和版本标签推送后，用 `ci.skip` 把同一个 ref 推到 GitGud，不强推，两边分叉就报错停下。Release 发布后，`release.yml` 的 `gitgud-backup` 按标签手动触发它。制品由 GitGud 自己的 Linux runner 上传，因为从 GitHub Actions 上传超过 100 MB 的文件会被 GitGud 前面的 Cloudflare 以 413 拒绝。工作流把 `.github/gitgud-backup.gitlab-ci.yml` 作为唯一的 `.gitlab-ci.yml` 推到 GitGud 的 `release-backup` 分支，用 API 带上 `PEACH_BACKUP_TAG` 触发流水线并等它结束。流水线从 GitGud 上同步过去的 master 取脚本，运行 `scripts/publish_gitlab_release.py --github-release <标签>`：下载 GitHub Release 的制品、`SHA256SUMS.txt` 与签名，按 GitHub 记录的 SHA-256 逐个核对，存进 GitGud 包仓库并登记 Release，摘要与签名原样保存。GitGud 上已有这一版的 Release 时直接跳过。旧版本在 Actions 里手动运行这个工作流补存，填写版本标签即可。凭据是仓库 secret `GITGUD_MIRROR_TOKEN`，即 GitGud 上带 `api` scope、Maintainer 角色的项目访问令牌，过期后两个作业都会失败。项目机器人令牌不能再建新的项目令牌，新建或续期要用项目所有者账号在网页上操作。R2 只留最近三个版本，GitHub Release 与 GitGud 保留全部版本。
+
 可选的 `r2` 后端使用独立 Standard 桶与 HTTPS 自定义域名。`PEACH_R2_ACCESS_KEY_ID`、`PEACH_R2_SECRET_ACCESS_KEY`、`PEACH_R2_ENDPOINT` 放入受保护且隐藏的 CI 变量，环境作用域为 `release`；`PEACH_R2_BUCKET` 和 `PEACH_R2_PUBLIC_BASE` 指定发布目标。S3 传输复用 rclone，版本文件禁止覆盖；每份文件必须从公开入口完整下载并核对大小及 SHA-256 后，才更新公开版本索引和 Release 链接。
 
 GitLab 演练通过 R2 暂存传递媒体工具、Windows 发行目录、macOS 镜像和 Docker 验收回执，job artifacts 保存 JSON 清单。中转需要上述 R2 变量；构建与验收任务使用 `release` 环境的 `prepare` 或 `verify` 动作，只有受保护版本标签与受保护 master 上的版本提交演练能取得凭据。候选保留到桌面与镜像都发布成功，由 `publication-cleanup` 回收；失败时保留供重试。构建期 rclone 按当前操作系统和 CPU 架构从官方固定版本归档安装并核对 SHA-256。
@@ -210,6 +212,8 @@ Mac 与 Windows 托盘的首层只显示简短状态与提醒数量，展开状�
 
 ### 终端 `peach init`
 
+`peach` 命令行的输出跟系统显示语言：中文系统显示中文，其余显示英文；设置环境变量 `PEACH_LANGUAGE=zh-CN` 或 `PEACH_LANGUAGE=en` 可以指定。日志固定用英文。
+
 在终端里直接运行 `peach init`（不带参数）会进入问答：
 
 1. 数据目录。
@@ -244,7 +248,9 @@ Windows 测试包默认使用 `%LOCALAPPDATA%\Peach\peach-data`。首次设置�
 
 ### 升级后的自动处理
 
-升级并启动 Peach 后，已配置的写入端自动完成数据库迁移、本地确定性资料修复与后台补全，无需手动启动补修。结构和资料处理前保留数据库备份；人工填写、复核结果与人工规范名受保护，存在身份冲突的项目保留复核记录。只读设备不执行这些写入。
+升级并启动 Peach 后，已配置的写入端自动完成数据库迁移、本地确定性资料修复与后台补全，无需手动启动补修。结构和资料处理前保留数据库备份；人工填写、复核结果与人工规范名受保护，存在身份冲突的项目保留复核记录。只读设备不执行这些写入。迁移前整份备份数据库，耗时随数据库大小；迁移期间网页照常打开，页面顶部显示「正在更新本地数据库」与备份进度，需要数据库的内容暂时读不到，完成后提示刷新页面。
+
+在任务中心调整自动修复速度后，同一写入端已排队和之后派发的自动修复批次沿用该速度；选择保存在数据目录中，重启后仍生效，不改变其他任务的默认速度。未单独调整时，自动修复采用新任务的默认速度。
 
 本版更新器允许读取端安装结构兼容的程序；若提示结构待迁移，先升级写入端并同步账本，再安装读取端更新，安装及失败恢复均不回写账本。仍使用旧更新器的读取端须先完成写入端升级及同步；旧助手在迁移被拒后仍可能写回自己的账本备份，当前程序无法追溯修改已经运行的旧助手。
 
@@ -329,6 +335,7 @@ SAR 显示尺寸按独立升级规则自动补测已登记的视频，只领取�
 | 读取配套资料、采集元数据与预览 | 已读取的本地证据、已写入的候选与已登记预览；保留完成影片和问题记录 |
 | 拉取关注更新、历史回抓 | 固定来源集合、成功来源与已提交页码；从头回抓任务沿用本次保存的页码 |
 | 新作订阅、想要资料、发现卡资料 | 已完成来源或番号、已保存资料与封面；发现卡同时保留已消耗请求与流量预算 |
+| 想要查找资源 | 已记账的想要与本轮计数；续跑只查还没到期记账的 |
 | 后继任务、下载后处理 | 原有持久队列与同一条任务记录；批量资料与样张保存原始番号集合和成功项目 |
 | 时间轴缩略图、媒体修复 | 已核验产物、带文件身份的检查结论与累计计数 |
 | 链接检查、关注来源查找、口味读取 | 已完成链接、检索行或浏览器资料；保留结果和处理范围 |
@@ -625,6 +632,8 @@ Windows 上 TLS 私钥禁用了权限继承，只允许实际运行服务的账�
 
 ## 播放与转码
 
+视频画质按显示尺寸的长边分档：3000 及以上为 4K，2000–2999 为 2K，1800–1999 为 1080P，1200–1799 为 720P，其余为低画质。已有视频以已测尺寸自动修正符合旧规则的分档，无需重读文件。需要还原时，`scripts/revert_auto_landing.py --source upgrade:quality-resolution` 先列计划，再用 `--apply --backup` 执行；尺寸或画质已变化的行不还原。
+
 浏览器能直接播放的格式（例如常见的 MP4）不需要额外软件。Windows 安装版和绿色版携带 FFmpeg、ffprobe 与修复损坏 MP4 索引用的 untrunc。源码部署缺少这些工具时，Windows x64 可在配置页「应用与维护」→「运行信息」点「安装」：Peach 从最新发布下载同一份 `tools-ffmpeg.zip` 或 `tools-untrunc.zip`，经 Peach 代理设置出网，按发布摘要校验整包、按包内清单校验每个文件，再解压到数据目录的 `tools/ffmpeg`、`tools/untrunc`，装好后那一行显示版本。下载中断或校验不符时已有文件不变，再点一次即重新下载；已装且校验相符时不重复下载。macOS 与 Linux 没有发布的工具包（macOS 应用与 Docker 镜像自带工具），源码部署仍按页面上的官方下载入口自行安装，或加入 PATH。首次设置缺少 OpenSSL 时也会给出下载入口。
 
 Peach 按下面的顺序找 FFmpeg 和 ffprobe：
@@ -642,10 +651,11 @@ untrunc 按相同顺序查找，对应目录为 `tools/untrunc`。独立程序�
 
 - 浏览器不支持的 AVI、MKV 等格式，Peach 会转成兼容的 MP4 缓存起来再播放，**不会改动原始文件**。第一次播放前会先探测文件，最长 20 秒。
 - 能保留的码流尽量保留：H.264（`yuv420p`／`yuvj420p`）视频不重新编码，AAC 音频直接复制，其他音频转成 AAC。需要重新编码视频时，自动模式依次尝试硬解加硬编、软解加硬编、全软件；Windows 使用 NVIDIA（`scale_cuda` + NVENC），Linux 使用可用 VAAPI 节点，macOS 使用 VideoToolbox。macOS 硬件编码通过实际合成帧探测，并禁止系统软件编码冒充硬件；H.264 输出采用 6 Mbit/s。AV1 硬解显式使用 FFmpeg 原生 `av1` 解码器，设备不支持时回退 dav1d 软件解码。
+- 「应用与维护 → 视频播放」的「画质上限」默认原画，可选 1080p、720p、480p，按短边计（竖屏片子的 720p 是宽 720）。只管重新编码的整片与 HLS 分片：短边超过上限才缩小，同时把峰值码率压到 8、4、2 Mbit/s；直接播放和只换封装的片子保持原画。帧在显存里的 CUDA、VAAPI 路径用 `scale_cuda`、`scale_vaapi`，其余用软件 `scale`；AMF、QSV、VAAPI 改用带峰值的 VBR。档位存在 `media-processing.json` 的 `playback_max_height`（`0/1080/720/480`），换档后新缓存的文件名带档位，原画沿用原来的缓存。
 - 同时最多进行 2 个转码或探测，单次最长 1 小时，关掉播放页会取消对应的任务。
 - 115 和 PikPak 的视频通过媒体库配置中声明的挂载目录播放。能不能播，以在 Peach 里实际打开一个已知视频为准。
 
-Peach 配置「媒体库与入库 → 视频预览」中的「抽帧解码方式」与「应用与维护 → 视频播放」中的「转码方式」分别保存为运行 Peach 那台电脑的偏好，两者互不影响，均可选择「自动（硬件优先）」或软件。抽帧设置控制封面、九宫格与时间轴；扫描、读 NFO 和时长探测不依赖 GPU。播放设置只控制 Peach 服务端的整片与 HLS 转码，浏览器直接播放时自行选择解码方式。保存无需重启，对新任务生效；已生成的有效缓存继续使用，运行中的 FFmpeg 不被强行中断。macOS 抽帧在同一超时预算内尝试 VideoToolbox，Windows 抽帧对 H.264、HEVC、VP9、AV1 尝试 D3D11VA，Linux 对同一范围尝试第一个可用 VAAPI 渲染节点，失败后都回退软件；视频编码格式探测按文件大小和修改时间缓存。Windows 播放的自动档依次探测 NVENC、AMF、QSV 编码，三者都不可用时用 D3D11VA 解码再交给 libx264；AMF 只接受 AMD 显卡上的 D3D11 设备，Peach 按显卡序号逐个探测。偏好通过 `/api/media-processing` 的 GET/POST 读写，`preview_acceleration` 和 `playback_acceleration` 分别接受 `auto/software`；省略的字段保持现值。这个接口与时间轴缩略图的 `/api/thumbnail-jobs` 和 `/api/configuration/*` 一样只接受运行 Peach 的电脑发来的请求，其他设备即使已登录或处于开放访问也返回 403。`PEACH_TRANSCODE_BACKEND` 可用于管理员诊断，支持 `auto/software/nvenc/amf/qsv/vaapi/videotoolbox`，显式 `software` 会保持禁用硬件。
+Peach 配置「媒体库与入库 → 视频预览」中的「抽帧解码方式」与「应用与维护 → 视频播放」中的「转码方式」分别保存为运行 Peach 那台电脑的偏好，两者互不影响，均可选择「自动（硬件优先）」或软件。抽帧设置控制封面、九宫格与时间轴；扫描、读 NFO 和时长探测不依赖 GPU。播放设置只控制 Peach 服务端的整片与 HLS 转码，浏览器直接播放时自行选择解码方式。保存无需重启，对新任务生效；已生成的有效缓存继续使用，运行中的 FFmpeg 不被强行中断。macOS 抽帧在同一超时预算内尝试 VideoToolbox，Windows 抽帧对 H.264、HEVC、VP9、AV1 尝试 D3D11VA，Linux 对同一范围尝试第一个可用 VAAPI 渲染节点，失败后都回退软件；视频编码格式探测按文件大小和修改时间缓存。Windows 播放的自动档依次探测 NVENC、AMF、QSV 编码，三者都不可用时用 D3D11VA 解码再交给 libx264；AMF 只接受 AMD 显卡上的 D3D11 设备，Peach 按显卡序号逐个探测。偏好通过 `/api/media-processing` 的 GET/POST 读写，`preview_acceleration` 和 `playback_acceleration` 分别接受 `auto/software`，`playback_max_height` 接受 `0/1080/720/480`；省略的字段保持现值。这个接口与时间轴缩略图的 `/api/thumbnail-jobs` 和 `/api/configuration/*` 一样只接受运行 Peach 的电脑发来的请求，其他设备即使已登录或处于开放访问也返回 403。`PEACH_TRANSCODE_BACKEND` 可用于管理员诊断，支持 `auto/software/nvenc/amf/qsv/vaapi/videotoolbox`，显式 `software` 会保持禁用硬件。
 
 卡片悬停预览请求的 `/stream` 不带流会话，取消不了，也看不到浏览器断开。片源需要整片转码且没有现成缓存时，这条请求直接回 415，不启动 FFmpeg；详情与沉浸模式带会话播放，关闭时按会话结束转码。
 
@@ -736,7 +746,7 @@ PikPak 官方核验通道使用「推送发现」中该媒体根对应的唯一 
 - Docker 全新数据卷不跑 `peach init`：`peach.server` 以 `serve --setup` 监听容器端口，设置文件出现后换成正常服务（ADR-0149）。守卫改按 `web_local_access.local_client` 收本机与私有网络、不带代理转发头的来源，403 正文带 `docker: true`；完成前 `/api/` 与写请求按同一判定拦下。读题不出 `data_root`、`host`、`port`、`mdns_name`，提交里带了也不认；`media_dir` 默认 `/media`，另给 `data_root`（固定的数据目录）与 `access_preset`（已按 `PEACH_ACCESS_PASSWORD` 写下访问密码）。完成后 `url` 与 `redirect` 都是当前地址下的 `/?onboarding=1`，`POST /api/setup/restore` 回 404。首次设置服务的 `/healthz?ready=1` 回 200 与 `setup: true`。
 - 两条接口共用守卫（`routes_pages._setup_guard`）：已配置 404，非回环来源 403，独立包地址栏主机名不是回环写法 403；提交另查 Origin（403）与设置文件已存在（409）。两条都在 `/api/` 下，错误一律回 JSON。
   - `GET /api/setup/questions` 给出画表单要的数据：`questions` 按 `onboarding.questions()` 的顺序列出每题的 `key`、`label`、`help`（说明行列表）、`default`、`required`、`advanced`（是否折进「高级设置」）、`input`（`text`、`number`、`choice`、`folders`）、`prefix`、`suffix`，`host` 另带按页面顺序排好的 `options`，`mdns_name` 另带 `visible_when: {"host": "2"}`；另有 `media_sources`、`media_source_default`、`media_root`（非 Windows 的对应路径格，Windows 为 `null`）、`cloud`（提示、帮助链接与缺失的挂载软件 `dependencies`）、`windows`、`standalone`，以及三个开关的初始值 `access_enabled`（host 默认是局域网就开）、`scan_now`、`history_guide`。
-  - `POST /api/setup` 收同名字段：`media_dir` 是 `{path, location, root}` 行列表（`location` 缺省为 `local`），`access_enabled`、`scan_now`、`history_guide` 是布尔，选了「只有这台电脑」可不传 `mdns_name`。400 回 `{"error", "errors"}`：`errors` 按题目 key，访问密码在 `access_password`，`media_dir` 与提交的行一一对应、没错的行是空串；整表不成立（超过 100 行）时只有一句，长度与行数不等。`apply` 失败回 400，错误在 `data_root`。200 回 `url`、`scan_requested`、`history_guide`、`standalone`、`redirect`（独立包为入口地址，其余为 `null`，跳转时长由前端定）与运行信息 `facts`（同 `/api/configuration` 的 `facts`）。
+  - `POST /api/setup` 收同名字段：`media_dir` 是 `{path, location, root}` 行列表（`location` 缺省为 `local`），`access_enabled`、`scan_now`、`history_guide` 是布尔，选了「只有这台电脑」可不传 `mdns_name`。第一步的 `interface_language`（`auto` 或已登记的界面语言）在新建账本时写进同步设置，接到已有账本时不改。400 回 `{"error", "errors"}`：`errors` 按题目 key，访问密码在 `access_password`，`media_dir` 与提交的行一一对应、没错的行是空串；整表不成立（超过 100 行）时只有一句，长度与行数不等。`apply` 失败回 400，错误在 `data_root`。200 回 `url`、`scan_requested`、`history_guide`、`standalone`、`redirect`（独立包为入口地址，其余为 `null`，跳转时长由前端定）与运行信息 `facts`（同 `/api/configuration` 的 `facts`）。
 - 建目录（`database`、`generated`、`sources`、`state`、`secrets`、`logs`、`tools`、`review`）、迁移数据库、生成 CA 与口令、写设置文件，都由 `onboarding.apply()` 完成；CLI 和设置页调用同一个函数，只是输出方式不同。问答的题目、默认值和写文件逻辑在 `src/peach/onboarding.py`。
 - 网页不展示数据库路径输入，`media_root` 为 `null`。`media_dir` 行中的 `root` 可省略或留空，服务端按媒体目录补齐；已有行提交原 `root` 时保留它。媒体目录与已有配置唯一匹配时复用原前缀，新目录自动生成前缀，并用目录名作为媒体库名称。
 - Windows 上 `peach init` 写出的 `[media.locations] local` 直接是那些目录，`[media.mounts]` 为空；macOS 上配置的目录是 `R:\media`（第二个起 `R:\media2`……），本机目录按同样顺序写进 `[media.mounts] local`。复制、writer 镜像、SMB 一律不问，保持关闭或留空。
@@ -856,7 +866,7 @@ Windows 托盘在取得单实例锁后启动独立监视器。监视器用 Win32
 - 版本号只在 `src/peach/__init__.py::__version__` 里定义，采用 pre-1.0 SemVer。Git 提交是构建标识，`vX.Y.Z` 标签是发布点，推到 GitHub 就触发 Release 工作流（见「桌面入口与发布」）。
 - 版本号在发布时才动，一次发布加一格，所以每个 `X.Y.Z` 都有一份能下载的制品。
 - **依赖升级**：定版前完成[每次发版检查](TESTING.md#每次发版检查)的依赖升级批次，包括适用的兼容修改、派生产物、完整验证与本地集成；暂不能升级的保留具体原因和失败证据。定版后发现需要改依赖时，先保存发行说明草稿，撤回本轮尚未提交的版本修改，完成升级后重新定版。
-- **定版**：在干净的 master 主检出上运行 `python scripts/release_tag.py --bump auto --apply`。它按上一个版本标签到 HEAD 的区间定档（`bump_part_for()`：主题以 `feat` 开头、带破坏性标记 `!`，或 `migrations/` 有新文件时推 minor，其余推 patch；1.0 要手工 `--bump major` 并另立 ADR，见 ADR-0012），写入 `__version__`，并把 `CHANGELOG.md` 的未发布一节定成这个版本号。区间只改了文档、技能和测试时直接拒绝，因为那样打出的包和上一个标签完全相同。minor 及以上的版本还须先在 `src/peach/release_notices.py` 写好这一版的更新公告，缺了也直接拒绝（[ADR-0152](adr/0152-release-notice-after-upgrade.md)）。`--bump` 只写文件不提交，并打印定版的那一节供人检查；不带 `--apply` 只打印计划。
+- **定版**：在干净的 master 主检出上运行 `python scripts/release_tag.py --bump auto --apply`。它按上一个版本标签到 HEAD 的区间定档（`bump_part_for()`：主题以 `feat` 开头、带破坏性标记 `!`，或 `migrations/` 有新文件时推 minor，其余推 patch；1.0 要手工 `--bump major` 并另立 ADR，见 ADR-0012），写入 `__version__`，并把 `CHANGELOG.md` 的 `Unreleased` 一节定成这个版本号（每行「English / 中文」，Release 正文英文在前、中文与下载段折叠，见 `scripts/changelog.py`）。区间只改了文档、技能和测试时直接拒绝，因为那样打出的包和上一个标签完全相同。minor 及以上的版本还须先在 `src/peach/release_notices.py` 写好这一版的更新公告，缺了也直接拒绝（[ADR-0152](adr/0152-release-notice-after-upgrade.md)）。公告的 `features` 连同 `refs` 里的 issue 或 PR 编号会写成 Release 正文开头的重点，旧版本检查更新时只显示这一组。`--bump` 只写文件不提交，并打印定版的那一节供人检查；不带 `--apply` 只打印计划。
 - **发布**：确认之后运行 `python scripts/release_tag.py --ship --apply`，一次完成剩下四步：提交 `src/peach/__init__.py` 与 `CHANGELOG.md`（消息 `chore(release): 版本 <新版本>`）、推送 master、每 30 秒查一次这个提交的 Test 工作流、变绿后创建并推送 annotated tag。打标签后继续等 GitHub Release 把 README 下载直链对应的制品全部上传完，再单独提交 `docs(readme): 下载直链指向 <标签>` 并推送；等待期间 README 仍指向上一版，中断后用 `--point-readme --apply` 补做。默认最多等 30 分钟，用 `--timeout` 修改。不带 `--apply` 只打印步骤。
 - `--ship` 在动手前检查：不在 master、变更日志缺这一节、标签已被占用、工作区除了那两份定版文件还有别的改动，任何一条成立就拒绝（标签指向发布提交，夹带什么就等于发布什么）。Test 结束不是绿色就立刻停，这时标签还没打。
 - 标签流水线第一步就跑仓库根与 `frontend` 两份 npm 审计；新公布的高危漏洞会让已打出的标签什么也发不了。所以 `--bump --apply` 写文件前、`--ship` 在 Test 转绿之后打标签之前，都先用 `scripts/npm_audit.py` 的同一判据复查一次，有高危漏洞就停，版本文件与标签都不动。
@@ -885,9 +895,9 @@ Windows 托盘在取得单实例锁后启动独立监视器。监视器用 Win32
 
 - 真实迁移前依次执行：SQLite 备份、asset/tag 计数、`PRAGMA integrity_check`、迁移版本检查、服务冒烟测试。已应用与待应用的迁移只认 `peach migrate status` 的输出。
 - 已应用的迁移文件不能修改，任何后续变更都要新增一个版本。已应用的迁移被改写会造成校验和漂移，只能用迁移前备份重放、逐条比对差异为 0 后再校正 `schema_migration`。
-- 数据库备份自动清退：`ledger.pre-*.db`（含设置页的手动备份 `pre-manual` 与恢复前另存的 `pre-restore`）由 `peach.ledger_backups` 管理，「最近 5 份」「24 小时内」「比 `ledger.db` 新」三类全部保留，其余连同 `-wal`／`-shm` 删除。Windows 托盘每次启动自动执行；`scripts/prune_ledger_backups.py` 手动运行时默认只列计划，`--apply` 才删除；数据库 `integrity_check` 不是 ok 时拒绝清退，退出码 2。每份备份一百多 MB，5 天不清就是 7 GB。
+- 数据库备份自动清退：`ledger.pre-*.db`（含设置页的手动备份 `pre-manual` 与恢复前另存的 `pre-restore`）由 `peach.ledger_backups` 管理，「最近几份」（默认 5 份，Peach 配置「保留期限」里可选 2、5、10、20，存在本机 `state/retention.json`）「24 小时内」「比 `ledger.db` 新」三类全部保留，其余连同 `-wal`／`-shm` 删除。Windows 托盘每次启动自动执行；`scripts/prune_ledger_backups.py` 手动运行时默认只列计划，`--apply` 才删除；数据库 `integrity_check` 不是 ok 时拒绝清退，退出码 2。每份备份一百多 MB，5 天不清就是 7 GB。
 - 整理备份自动清退：下载后整理与手动整理写入前各留一份整库备份，放在 `<Peach 数据目录>/generated/organize-backups/`，文件名是 `ledger.pre-download-<任务>-<时间>.db` 与 `ledger.pre-organize-<时间>-<任务>.db`。每次写备份后按同一套规则清退这个目录，只留最近 5 份（`ORGANIZE_KEEP_RECENT`），不按年龄保留（`ORGANIZE_MIN_AGE` 为零）：一波下载一小时能整理四十个文件，24 小时窗口会攒下几十 GB。正在被整理引用的那份由 `ledger_backups.holding` 登记，Web 服务进程里的清退都跳过；目录里的其他文件名不动。手动查看或清理用 `scripts/prune_ledger_backups.py --organize`，同样默认只列计划，`--apply` 才删除；登记不跨进程，整理进行中不要给 `--keep 0`。
-- `<Peach 数据目录>/logs` 里的 `*.log` 统一保留半年，不限大小（`peach.log_retention.sweep`，托盘在启动任何子进程之前运行）：半年没写过的文件整份删除；还在写的文件按自然月分段，上次写入在更早月份的改名成 `<名字>.until-<最后写入日期>.log`，再过半年删除。子进程直接追加 stdout，不经过 `logging`，所以按文件处理，不按行处理。
+- `<Peach 数据目录>/logs` 里的 `*.log` 默认保留半年，不限大小（`peach.log_retention.sweep`，托盘在启动任何子进程之前运行；天数在「保留期限」里可选 30、90、183、365，同样存在 `state/retention.json`）：超过保留期没写过的文件整份删除；还在写的文件按自然月分段，上次写入在更早月份的改名成 `<名字>.until-<最后写入日期>.log`，再过保留期删除。子进程直接追加 stdout，不经过 `logging`，所以按文件处理，不按行处理。
 - 更新与打包产物自动清退：托盘每次启动只保留最近 2 份 `dist/Peach/Peach.pre-source-sync-*.exe` 备份，并删掉 `<Peach 数据目录>/state/source-sync-build/` 里不属于待应用记录的暂存构建（`WindowsUpdateInstaller.sweep_artifacts`）；`build_windows.ps1` 成功后删掉 PyInstaller 工作目录 `build/windows/app`；单文件托盘每次启动删掉 `%TEMP%` 里超过一天、不属于自己的 `_MEI*` 解压残留（`sweep_onefile_extractions`，托盘被结束进程时 PyInstaller 不会自己清理，每份 40–80 MB）。自动清理只认这几种命名：`Peach.exe` 本体、手工放进 `dist/` 的目录、`build/release-*`、`attic/` 都不碰，手工构建的残留要自己删。
 - 可重建缓存的删除范围由当前数据库路径决定：生产库只能清理同一个 `peach-data` 下的缓存，临时库只能清理它的临时目录，范围之外一律跳过。测试里的清空回收站必须用临时 Peach 数据目录，漏配会删到真实封面。
 - 资源同步使用后台作业并逐来源报告进度，避免同步全库扫描阻塞请求；同一目录只枚举一次，目录元数据并发固定为 8，不重跑全库，也不盲信旧结果。

@@ -20,14 +20,17 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 from .catalog_rules import normalise_code_key, release_code_from_text
+from .coded_text import Said, coded, columns, restored
+from .content_words import COMPILATION_TITLE, DMM_HOURS, DMM_MINUTES, JAVDB_WORK_COUNT
 from .entities import normalize_entity_name
+from .user_messages import UserValueError
 
 #: JavDB 演员页当伪 Feed 抓。它按发行日排在前面，所以「还没发行的作品」会先出现。
 KIND_JAVDB_ACTOR = "javdb-actor"
 #: DMM 按女优编号列的片单（GraphQL）。预购排在最前，番号是官方 `makerContentId`。
 KIND_DMM_ACTRESS = "dmm-actress"
 
-KIND_LABELS = {KIND_JAVDB_ACTOR: "JAV 订阅", KIND_DMM_ACTRESS: "JAV 订阅 · DMM"}
+KIND_LABELS = {KIND_JAVDB_ACTOR: "labels.feeds.kind.javdbActor", KIND_DMM_ACTRESS: "labels.feeds.kind.dmmActress"}
 
 #: DMM 片单那一类的订阅地址：用户点得开的女优片单页，同时是 `feed_source.url` 的去重键。
 #: 拉取不 GET 它，而是按地址里的编号问 GraphQL。
@@ -71,13 +74,12 @@ _TAGS = re.compile(r"<[^>]+>")
 #: 演员页标题栏：站上这一页挂在哪个名字下，和页面自报的作品数。一位女优常有两页，
 #: 本名一页、旧艺名一页（森日向子的另一页挂在「白石アイリ」下），名字是区分两行的唯一线索。
 _JAVDB_ACTOR_NAME = re.compile(r'<span class="actor-section-name">([^<]*)</span>')
-_JAVDB_WORK_COUNT = re.compile(r'<span class="section-meta">\s*(\d+)\s*部影片\s*</span>')
+_JAVDB_WORK_COUNT = re.compile(JAVDB_WORK_COUNT)
 
 #: 合集的标题记号：精选、总集、连发。`BEST` 前后不许紧挨字母，`BESTIE` 那种词不算。
-_COMPILATION_TITLE = re.compile(
-    r"(?<![A-Za-z])BEST(?![A-Za-z])|ベスト|総集編|傑作選|\d+\s*連発")
-_HOURS = re.compile(r"(\d+)\s*時間")
-_MINUTES = re.compile(r"(\d{3,})\s*分")
+_COMPILATION_TITLE = re.compile(COMPILATION_TITLE)
+_HOURS = re.compile(DMM_HOURS)
+_MINUTES = re.compile(DMM_MINUTES)
 #: 片长到这个数就是剪辑合集：单部新片两到三小时，四小时起是把旧片拼起来卖。
 COMPILATION_MINUTES = 240
 #: 出演人数到这个数就是合集：正常共演两三人，合集一列就是十几二十个名字。
@@ -251,7 +253,7 @@ def parse_dmm_actress(works) -> ParsedFeed:
 
 def dmm_actress_url(actress_id: str) -> str:
     if not _DMM_ACTRESS_ID.match(str(actress_id or "")):
-        raise ValueError("DMM 女优编号只认数字")
+        raise UserValueError("errors.feeds.dmmActressIdDigits")
     return DMM_ACTRESS_PAGE.format(id=actress_id)
 
 
@@ -287,7 +289,7 @@ def normalize_url(value: object) -> str:
     """
     url = str(value or "").strip()
     if not url.startswith("https://"):
-        raise ValueError("订阅地址必须以 https:// 开头")
+        raise UserValueError("errors.feeds.httpsRequired")
     return url
 
 
@@ -301,7 +303,7 @@ def add_source(connection: sqlite3.Connection, *, url: str, name: str = "",
     """登记一条订阅，类型按地址认。地址重复直接拒绝——同一个源订两遍只会让同一条新作出现两次。"""
     address = normalize_url(url)
     if connection.execute("SELECT 1 FROM feed_source WHERE url=?", (address,)).fetchone():
-        raise ValueError("这个订阅地址已经在列表里了")
+        raise UserValueError("errors.feeds.duplicateUrl")
     cursor = connection.execute(
         "INSERT INTO feed_source(kind,name,url,entity_id,enabled,interval_minutes,"
         "created_at) VALUES(?,?,?,?,1,?,?)",
@@ -412,7 +414,7 @@ def sources(connection: sqlite3.Connection) -> list[dict]:
     return [{
         "id": int(row["id"]),
         "kind": row["kind"],
-        "kind_label": KIND_LABELS.get(row["kind"], row["kind"]),
+        **coded("kind_label", Said(KIND_LABELS[row["kind"]]) if row["kind"] in KIND_LABELS else row["kind"]),
         "name": row["entity_name"] or row["name"] or "",
         "page_name": row["name"] or "",
         "url": row["url"],
@@ -422,7 +424,7 @@ def sources(connection: sqlite3.Connection) -> list[dict]:
         "interval_minutes": int(row["interval_minutes"]),
         "last_fetched_at": row["last_fetched_at"],
         "next_fetch_at": row["next_fetch_at"],
-        "last_error": row["last_error"],
+        **coded("last_error", restored(row["last_error"], row["last_error_code"], row["last_error_params"])),
         "last_seen_count": int(row["last_seen_count"]),
         "last_new_count": int(row["last_new_count"]),
         "seen": int(row["seen"] or 0),
@@ -430,11 +432,39 @@ def sources(connection: sqlite3.Connection) -> list[dict]:
 
 
 def due_sources(connection: sqlite3.Connection, now: str | None = None) -> list[sqlite3.Row]:
-    """到期该拉的源，等得最久的在前。从没拉过的（`next_fetch_at` 为空）总是到期，排最前。"""
+    """到期该拉的源，等得最久的在前。从没拉过的（`next_fetch_at` 为空）总是到期，排最前。
+
+    同一位女优的 DMM 片单在拉时，她在 JavDB 上的有碼演员页绕过不拉（`covered_by_dmm`）：两边列的是
+    同一批作品，JavDB 那页只多花请求。源本身不停用，DMM 片单停了或手动拉取时照常拉。
+    """
     moment = now or stamp()
-    return list(connection.execute(
+    rows = list(connection.execute(
         "SELECT * FROM feed_source WHERE enabled=1"
         " AND (next_fetch_at IS NULL OR next_fetch_at<=?) ORDER BY next_fetch_at, id", (moment,)))
+    skipped = covered_by_dmm(connection)
+    return [row for row in rows if int(row["id"]) not in skipped]
+
+
+def covered_by_dmm(connection: sqlite3.Connection) -> set[int]:
+    """DMM 片单已经覆盖的 JavDB 演员页源 id：同一人的 DMM 片单源在拉、上一次拉成功，且这一页不是她的無碼记录。
+
+    DMM 不卖无码，無碼那一页照拉；记录类型读不出来的按有碼算（JavDB 上不带标记的那一条就是有碼）。
+    DMM 片单还没拉过或上次失败时不绕过：刚订时两边各拉一次，DMM 出错时 JavDB 接上，不漏新作。
+    """
+    from .entry_links import _ref_metadata, javdb_actor_page
+    rows = list(connection.execute(
+        "SELECT s.id, s.url, s.entity_id FROM feed_source s WHERE s.enabled=1 AND s.kind=?"
+        " AND s.entity_id IS NOT NULL AND EXISTS (SELECT 1 FROM feed_source d WHERE d.entity_id=s.entity_id"
+        " AND d.enabled=1 AND d.kind=? AND d.last_fetched_at IS NOT NULL AND d.last_error IS NULL)",
+        (KIND_JAVDB_ACTOR, KIND_DMM_ACTRESS)))
+    covered: set[int] = set()
+    for row in rows:
+        uncensored = {javdb_actor_page(str(ref["external_id"])) for ref in connection.execute(
+            "SELECT external_id, metadata_json FROM entity_external_ref WHERE entity_id=? AND provider='javdb'",
+            (int(row["entity_id"]),)) if _ref_metadata(dict(ref)).get("uncensored") is True}
+        if row["url"] not in uncensored:
+            covered.add(int(row["id"]))
+    return covered
 
 
 def next_fetch(source_id: int, moment: datetime, interval_minutes: int) -> datetime:
@@ -463,14 +493,15 @@ def settle(connection: sqlite3.Connection, source_id: int, *, error: str | None 
     失败也按同一间隔排下一次，不做指数退避——退避要么在这里写第二套判据，要么让一个
     临时挡回来的源沉默半天。下次时间在所有返回路径上都写，任何一种结局都不会让源卡住。
     `retry_at` 是来源冷却的结束时刻：被整站挡回来的不是这个源的错，冷却一过就该再拉。
+    `error` 是 `Said` 时旁边一并存下 code 与参数，界面按当前语言显示。
     """
     moment = now or datetime.now(timezone.utc)
     upcoming = retry_at or next_fetch(source_id, moment, interval_minutes)
     connection.execute(
-        "UPDATE feed_source SET last_error=?,last_fetched_at=?,next_fetch_at=?,"
-        "etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified),"
+        "UPDATE feed_source SET last_error=?,last_error_code=?,last_error_params=?,last_fetched_at=?,"
+        "next_fetch_at=?,etag=COALESCE(?,etag),last_modified=COALESCE(?,last_modified),"
         "name=COALESCE(?,name),last_seen_count=?,last_new_count=? WHERE id=?",
-        (error, stamp(moment), stamp(upcoming),
+        (error, *columns(error), stamp(moment), stamp(upcoming),
          etag, last_modified, page_name or None, int(seen), int(new), int(source_id)))
 
 
@@ -494,13 +525,14 @@ def in_library(connection: sqlite3.Connection, code: str) -> bool:
     比的是归一化之后的键：账本里写的是 `SSIS-950`，源里可能给 `ssis00950`，
     按原文比会把同一部片当成两部。`normalise_code_key` 由 `LedgerDatabase.connect`
     注册成 SQL 函数，两侧因此是同一份实现。标「已消失」的行文件已不在盘上，不算入库
-    （ADR-0087）；回收站里的仍算，那是用户看过之后丢的。
+    （ADR-0087）；回收站里的仍算，那是用户看过之后丢的。只算视频：番号目录里的封面图、
+    广告图也带着番号，视频删掉后它们还在，不能让一张封面把这部片算成在库。
     """
     key = normalise_code_key(code)
     if not key:
         return False
     row = connection.execute(
-        "SELECT 1 FROM asset WHERE code IS NOT NULL AND COALESCE(disposal,'')<>'vanished' "
+        "SELECT 1 FROM asset WHERE medium='video' AND code IS NOT NULL AND COALESCE(disposal,'')<>'vanished' "
         "AND normalise_code_key(code)=? LIMIT 1",
         (key,)).fetchone()
     return row is not None

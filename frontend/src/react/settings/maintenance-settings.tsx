@@ -15,11 +15,14 @@ import type {
 import { PathLine } from '../components/path-line';
 import { groupRoot } from './configuration-panel';
 import { LedgerBackupSettings } from './ledger-backup-settings';
+import { RetentionSettings } from './retention-settings';
 import { LibrarySharingSettings } from './library-sharing-settings';
 import { RemoteReportingSettings } from './remote-reporting-settings';
 import { Disclosure, ErrorText, ExternalLink, Fact, FactList, Footer, Help, Rows, Section, Stack } from './section';
 import { StorageSettings } from './storage-settings';
 import { busyProps, useAction } from './use-action';
+import { localizedFact } from './coded-text';
+import { codedText, serverText } from '../../core/server-text';
 import { t } from '../../i18n';
 
 const INTERVALS = [['6', t('settings:automaticUpdates.every6Hours')], ['24', t('settings:automaticUpdates.daily')], ['168', t('settings:automaticUpdates.weekly')]] as const;
@@ -31,6 +34,7 @@ export function MaintenanceSettings(
     <div {...groupRoot(panel)}>
       {data.storage ? <StorageSettings initial={data.storage} receipt={receipt} /> : null}
       {data.storage ? <LedgerBackupSettings receipt={receipt} /> : null}
+      {data.storage ? <RetentionSettings receipt={receipt} /> : null}
       {data.remote_reporting || data.library_sharing ? <Section id="librarySharing" guide="reporting" title={t('settings:dataSharing.title')}>
         {data.remote_reporting ? <RemoteReportingSettings initial={data.remote_reporting} receipt={receipt} /> : null}
         {data.library_sharing ? <div className="border-t border-separator-border">
@@ -58,7 +62,7 @@ export function TutorialSettings({ reopenTutorial }: ConfigurationProps) {
 export function AutomaticUpdates({ initial, receipt }: { initial: AutomaticUpdateState; receipt(message: string): void }) {
   const [mode, setMode] = useState(initial.mode);
   const [hours, setHours] = useState(initial.interval_hours);
-  const action = useAction(initial.error);
+  const action = useAction(initial.error ? codedText(initial, 'error') : initial.error);
 
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -85,7 +89,7 @@ export function AutomaticUpdates({ initial, receipt }: { initial: AutomaticUpdat
             onChange={(on) => setMode(on ? 'download' : 'check')} />
         </SettingsRow>
         <SettingsRow label={t('settings:autoUpdate.frequency')} description={help}>
-          <Select aria-label={t('settings:autoUpdate.frequency')} selectedKey={String(hours)} isDisabled={!initial.available}
+          <Select aria-label={t('settings:autoUpdate.frequency')} selectedKey={String(hours)} isDisabled={!initial.available || mode === 'off'}
             onSelectionChange={(key) => { if (key !== null) setHours(Number(key)); }}>
             {INTERVALS.map(([key, name]) => <SelectItem key={key} id={key}>{name}</SelectItem>)}
           </Select>
@@ -107,8 +111,8 @@ function Facts({ facts: loaded, receipt }: { facts: ConfigurationFact[]; receipt
   const action = useAction();
   const install = (tool: string) => void action.run(tool, (signal) => apiSend<{ message: string; facts: ConfigurationFact[] }>(
     '/api/configuration/media-tools', { tool }, 'POST', signal), (result) => {
-    setInstalled(result.facts);
-    receipt(result.message);
+    setInstalled(result.facts.map(localizedFact));
+    receipt(serverText(result) || result.message);
   });
   return (
     <Section guide="facts" title={t('settings:runtimeInfo.title')}>
@@ -145,13 +149,13 @@ export function UninstallSettings(
       : t('settings:uninstall.confirmAppOnly'),
     confirmLabel: t('settings:uninstall.title'),
     onConfirm: async () => {
-      const result = await apiSend<{ message: string }>('/api/configuration/uninstall', { delete_data: removeData, confirmation: '卸载 Peach' }); // i18n-exempt: 服务端校验的确认值
-      setAccepted(result.message);
+      const result = await apiSend<{ message: string }>('/api/configuration/uninstall', { delete_data: removeData, confirmation: 'uninstall-peach' }); // 服务端校验的确认值，用户不输入
+      setAccepted(serverText(result) || result.message);
     },
   });
   // 底栏左边一句说这颗按钮此刻意味着什么：拦住卸载的理由（源码安装、更新还在跑）和按下去
   // 之后的回执都在答「这颗现在能不能按」，摆在正文末尾就得先读完整段说明才找得到。
-  const status = accepted || uninstall.message;
+  const status = accepted || codedText(uninstall, 'message');
   const paths = [...new Set([uninstall.data_root, ...uninstall.directories])];
   return (
     <Section id="uninstallPeach" guide="uninstall" title={t('settings:uninstall.title')}>

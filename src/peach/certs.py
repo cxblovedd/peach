@@ -23,6 +23,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from .user_messages import UserRuntimeError
 
 
 LOGGER = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ CERT_DAYS = 397
 RENEW_BEFORE_DAYS = 30
 #: 根证书十年有效期。它只在首次运行时生成一次，之后指纹不能变。
 CA_DAYS = 3650
+#: 单次 openssl 调用的期限（秒）；签发、读证书都是瞬时操作。
+OPENSSL_SECONDS = 60.0
 
 _SAN_DNS = re.compile(r"DNS:([^,\s]+)")
 _SAN_IP = re.compile(r"IP Address:([^,\s]+)")
@@ -60,18 +63,24 @@ class CertificateFiles:
 def _openssl(*args: str, stdin: bytes | None = None) -> str:
     binary = shutil.which("openssl") or "/usr/bin/openssl"
     if not Path(binary).is_file():
-        raise RuntimeError("未找到 OpenSSL，请安装并加入 PATH 后重试")
-    result = subprocess.run(
-        [binary, *args], input=stdin, capture_output=True,
-        # 显式给 encoding：text=True 会用平台默认编码，中文输出会静默丢成空 stdout。
-        text=stdin is None, encoding=None if stdin is not None else "utf-8",
-        errors=None if stdin is not None else "replace",
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
+        raise UserRuntimeError("errors.certs.opensslMissing")
+    try:
+        result = subprocess.run(
+            # 不给输入时接 DEVNULL：要口令之类的交互提示读到 EOF 就失败，不会等一个没人敲的终端。
+            [binary, *args], input=stdin, stdin=subprocess.DEVNULL if stdin is None else None,
+            capture_output=True, timeout=OPENSSL_SECONDS,
+            # 显式给 encoding：text=True 会用平台默认编码，中文输出会静默丢成空 stdout。
+            text=stdin is None, encoding=None if stdin is not None else "utf-8",
+            errors=None if stdin is not None else "replace",
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except subprocess.TimeoutExpired:
+        raise UserRuntimeError("errors.certs.opensslFailed", {
+            "command": args[0], "detail": f"timed out after {OPENSSL_SECONDS:g}s"}) from None
     if result.returncode != 0:
         detail = result.stderr if isinstance(result.stderr, str) else result.stderr.decode(
             "utf-8", "replace")
-        raise RuntimeError(f"openssl {args[0]} 失败：{detail.strip()[:200]}")
+        raise UserRuntimeError("errors.certs.opensslFailed", {"command": args[0], "detail": detail.strip()[:200]})
     return result.stdout if isinstance(result.stdout, str) else result.stdout.decode(
         "utf-8", "replace")
 
@@ -115,22 +124,22 @@ def has_authority_key_identifier(cert: Path) -> bool:
 def reissue_reason(
     files: CertificateFiles, names: set[str], addresses: set[str], now: datetime | None = None,
 ) -> str | None:
-    """需要重签就返回原因，不需要返回 None。"""
+    """需要重签就返回原因（英文，只进日志），不需要返回 None。"""
     if not files.cert.is_file() or not files.key.is_file():
-        return "服务器证书不存在"
+        return "server certificate missing"
     if not has_authority_key_identifier(files.cert):
-        return "证书缺少颁发者密钥标识"
+        return "certificate lacks an authority key identifier"
     have_names, have_addresses = subject_alt_names(files.cert)
     missing = (names - have_names) | (addresses - have_addresses)
     if missing:
-        return "证书未覆盖：" + "、".join(sorted(missing))
+        return "certificate does not cover: " + ", ".join(sorted(missing))
     expiry = not_after(files.cert)
     if expiry is None:
-        return "读不出证书有效期"
+        return "certificate expiry unreadable"
     stamp = now or datetime.now(timezone.utc)
     remaining = (expiry - stamp).days
     if remaining <= RENEW_BEFORE_DAYS:
-        return f"证书还有 {remaining} 天到期"
+        return f"certificate expires in {remaining} days"
     return None
 
 
@@ -192,7 +201,7 @@ def create_local_ca(files: CertificateFiles, days: int = CA_DAYS) -> Path:
              "-addext", "basicConstraints=critical,CA:TRUE,pathlen:0",
              "-addext", "keyUsage=critical,keyCertSign,cRLSign",
              "-addext", "subjectKeyIdentifier=hash")
-    LOGGER.info("已生成本机 CA：%s", files.ca_cert)
+    LOGGER.info("Generated local CA: %s", files.ca_cert)
     return files.ca_cert
 
 
@@ -233,7 +242,7 @@ def ensure_certificate(
     reason = reissue_reason(files, names, wanted)
     if reason is None:
         return None
-    LOGGER.info("重签服务器证书：%s", reason)
+    LOGGER.info("Reissued server certificate: %s", reason)
     reissue(files, common_name, names, wanted)
     return reason
 

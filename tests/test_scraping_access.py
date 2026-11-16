@@ -12,6 +12,7 @@ from unittest.mock import patch
 import httpx
 from PIL import Image
 
+from peach import interface_text
 from peach.http import HttpRequest, HttpResponse, HttpxTransport
 from peach.scraping_access import (SourceTransport, client_for, cookie_jar, describe,
                                    save, source_for, values_for)
@@ -560,16 +561,64 @@ class ScrapingAccessTests(unittest.TestCase):
         self.assertEqual(direct(request, 1, 100).status, 200)
         self.assertFalse(cooldown.exists())
 
+    def test_the_javdb_account_cookie_rides_only_on_requests_the_user_opened(self):
+        """后台任务匿名取 JavDB，用户点开的页面才带登录账号；JavBus 年龄门的会话照带。"""
+        from peach import scraping_access
+        save(self.root, "javdb", {"cookie": "_jdb_session=private"})
+        self.assertFalse(scraping_access.sends_cookie("javdb"))
+        self.assertTrue(scraping_access.sends_cookie("javbus"))
+        with scraping_access.with_account():
+            self.assertTrue(scraping_access.sends_cookie("javdb"))
+        self.assertFalse(scraping_access.sends_cookie("javdb"))
+        with patch.object(scraping_access, "client_for", wraps=scraping_access.client_for) as made:
+            SourceTransport(self.root)._transport_for("javdb").close()
+            with scraping_access.with_account():
+                SourceTransport(self.root)._transport_for("javdb").close()
+        self.assertEqual([call.kwargs["session"] for call in made.call_args_list], [False, True])
+        # 匿名那次撞上 403，不让人去换 Cookie：这次根本没带。
+        transport = SourceTransport(self.root)
+        transport.transports["javdb"] = lambda *args: HttpResponse(403, {}, b"")
+        with self.assertRaises(scraping_access.SourcePaused) as caught:
+            transport(HttpRequest("GET", "https://javdb.com/search?q=ABP-616&f=all", {}), 1, 100)
+        self.assertNotIn("Cookie", str(caught.exception))
+
+    def test_a_suspended_account_pauses_until_the_page_says_it_resumes(self):
+        """账号被临时停用与出口被拦分开：按页面写的恢复时刻停，提示里说停的是账号、换出口没用。"""
+        from peach.scraping_access import SourceRefused, cooldown_state
+        from datetime import datetime, timedelta, timezone
+        resume = datetime.now(timezone(timedelta(hours=8))).replace(second=0, microsecond=0) + timedelta(hours=5)
+        body = ("<html><body><div>帳號已被臨時停用：系統檢測到該帳號的瀏覽速度遠超正常用戶，判定為異常採集行為。"
+                f"將於 {resume:%Y-%m-%d %H:%M}（UTC+08:00）自動恢復。</div></body></html>").encode("utf-8")
+        save(self.root, "javdb", {"cookie": "_jdb_session=private"})
+        transport = SourceTransport(self.root)
+        transport.transports["javdb"] = lambda *args: HttpResponse(403, {}, body)
+        with self.assertRaises(SourceRefused) as caught:
+            transport(HttpRequest("GET", "https://javdb.com/search?q=ABP-616&f=all", {}), 1, 100000)
+        self.assertEqual(caught.exception.reason, "account_suspended")
+        self.assertIn("账号被临时停用", str(caught.exception))
+        self.assertIn("换出口没用", str(caught.exception))
+        until, blocks = cooldown_state(self.root, "javdb")
+        self.assertAlmostEqual(until, resume.timestamp(), delta=1)
+        self.assertEqual(blocks, 0, "账号停用不往出口封禁那档翻倍")
+
     def test_a_new_cookie_lifts_the_pause_the_old_one_earned(self):
         """过期的 `cf_clearance` 撞出 403 后整站冷却；用户换了新 Cookie 就该立刻再试，不等旧账到期。"""
         from peach.scraping_access import SourcePaused
         cooldown = self.root / "scraping-javten.cooldown.json"
         request = HttpRequest("GET", "https://javten.com/search?kw=4898837", {})
+        # 没贴过 Cookie 时，裸 403 不提 Cookie。
         refused = SourceTransport(self.root)
         refused.transports["javten"] = lambda *args: HttpResponse(403, {}, b"")
         with self.assertRaises(SourcePaused) as caught:
             refused(request, 1, 100)
-        self.assertIn("更新它的 Cookie", str(caught.exception))
+        self.assertNotIn("Cookie", str(caught.exception))
+        cooldown.unlink()
+        save(self.root, "javten", {"cookie": "cf_clearance=old"})
+        refused = SourceTransport(self.root)
+        refused.transports["javten"] = lambda *args: HttpResponse(403, {}, b"")
+        with self.assertRaises(SourcePaused) as caught:
+            refused(request, 1, 100)
+        self.assertIn("Cookie 已过期", str(caught.exception))
         self.assertTrue(cooldown.exists())
         save(self.root, "javten", {"network": "peach"})
         self.assertTrue(cooldown.exists(), "只改连接方式不算换了 Cookie")
@@ -642,7 +691,7 @@ class ScrapingAccessTests(unittest.TestCase):
 
     def test_cover_failure_explains_observed_cause_without_exposing_urls(self):
         from peach.web_scraping import _fetch_cover
-        from peach.jav_cover_fetch import Unavailable
+        from peach.jav_cover_fetch import NotFound
         contract = SimpleNamespace(cover_root=self.root, candidate_root=self.root,
                                    follow_secrets_root=self.root / "secrets", follow_sources_root=self.root)
         cases = [(403, "access_denied"), (503, "source_error"), (404, "no_candidate"), (None, "network")]
@@ -652,7 +701,7 @@ class ScrapingAccessTests(unittest.TestCase):
                     transport(HttpRequest("GET", "https://example.test/private?token=secret", {}), 1, 100)
                 except httpx.TransportError:
                     pass
-                raise Unavailable("所有渠道都没有候选")
+                raise NotFound("errors.javCoverFetch.noCandidates")
             with self.subTest(reason=reason), patch("peach.jav_cover_fetch.best_cover", side_effect=fetch), \
                     patch("peach.web_scraping.SourceTransport") as factory:
                 if status is None:
@@ -668,21 +717,34 @@ class ScrapingAccessTests(unittest.TestCase):
     def test_unreachable_dmm_image_hosts_point_at_the_connection_setting(self):
         """中国移动宽带直连 DMM 图片主机大多在握手后被断开：封面比较和连接检查都要把人
         指到 DMM / FANZA 的连接方式上，而不是说官方没有图、或让人去官网登录。"""
-        from peach.web_scraping import MOBILE_BROADBAND_HINT, _fetch_cover
-        from peach.jav_cover_fetch import HOSTS_UNREACHABLE, CoverConnectError
+        from peach.source_checks import MOBILE_BROADBAND_HINT
+        from peach.web_scraping import _fetch_cover
+        from peach.jav_cover_fetch import HOSTS_UNREACHABLE, HOSTS_UNREACHABLE_CODE, CoverConnectError
         contract = SimpleNamespace(cover_root=self.root, candidate_root=self.root,
                                    follow_secrets_root=self.root / "secrets", follow_sources_root=self.root)
-        with patch("peach.jav_cover_fetch.best_cover", side_effect=CoverConnectError(HOSTS_UNREACHABLE)), \
+        with patch("peach.jav_cover_fetch.best_cover", side_effect=CoverConnectError(HOSTS_UNREACHABLE_CODE)), \
                 patch("peach.web_scraping.SourceTransport"):
             result = _fetch_cover(contract, "ABW-232")
         self.assertEqual(result["reason"], "network")
-        self.assertIn(MOBILE_BROADBAND_HINT, result["error"])
+        self.assertEqual(result["error"], f"{HOSTS_UNREACHABLE}，未能完成封面比较；{MOBILE_BROADBAND_HINT}已有图片保留。")
+        english = "".join(interface_text.text(f"server:{part['code']}", part["params"], language="en")
+                          for part in result["error_parts"])
+        self.assertEqual(english, "Can't connect to any official image host, so the cover comparison didn't finish. "
+                                  "On China Mobile broadband, direct connections to DMM image hosts are often dropped "
+                                  "after the handshake; set the DMM / FANZA connection to the Peach proxy. "
+                                  "The existing image was kept.")
         with patch("peach.source_checks.SourceTransport") as factory:
             factory.return_value.side_effect = httpx.ConnectError("EOF occurred in violation of protocol")
             checks = {item["label"]: item for item in
                       w_scraping_check(SimpleNamespace(follow_secrets_root=self.root), {"source": "dmm"})["results"]}
         self.assertIn(MOBILE_BROADBAND_HINT, checks["高清图片 CDN"]["message"])
         self.assertNotIn(MOBILE_BROADBAND_HINT, checks["来源页面"]["message"])
+        cdn = checks["高清图片 CDN"]
+        self.assertEqual((cdn["target"], checks["来源页面"]["target"]), ("cdn", "page"))
+        self.assertEqual(interface_text.text(f"server:{cdn['label_code']}", language="en"), "HD image CDN")
+        self.assertEqual(interface_text.text(f"server:{cdn['message_code']}", cdn["message_params"], language="en"),
+                         "Can't connect. On China Mobile broadband, direct connections to DMM image hosts are often "
+                         "dropped after the handshake; set the DMM / FANZA connection to the Peach proxy.")
 
 
 class BrowserFallbackTests(unittest.TestCase):

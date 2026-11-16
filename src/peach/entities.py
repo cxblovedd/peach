@@ -8,6 +8,9 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 from sqlite3 import Connection
 
+from .catalog_vocabulary import PERFORMER_TAG_PREFIX
+from .user_messages import UserValueError
+
 #: 只读请求里记住的名字解析结果，见 `memoized_resolution`。
 _RESOLVED: ContextVar[dict | None] = ContextVar("peach_resolved_entities", default=None)
 
@@ -99,7 +102,7 @@ def _ingest_name_id(connection: Connection, kind: str, name: str) -> int | None:
                    "SELECT a.entity_id,a.alias FROM entity_alias a JOIN entity e ON e.id=a.entity_id WHERE e.kind='tag'")
                    if normalize_entity_name(canonical_tag_name(row[1])) == normalized}
     if kind == 'tag' and len(matches) > 1:
-        raise ValueError('标签别名存在冲突，请先合并重复标签')
+        raise UserValueError('errors.entities.tagAliasConflict')
     return next(iter(matches)) if len(matches) == 1 else None
 
 
@@ -325,7 +328,7 @@ def canonicalize_entity_name(kind: str, name: str | None) -> str:
     return canonical
 
 
-#: 规范名有一份扁平投影（ADR-0005）：女优落在 `asset_tag` 的 `演员:` 标签里，其余三种
+#: 规范名有一份扁平投影（ADR-0005）：女优落在 `asset_tag` 的 `performer:` 标签里，其余三种
 #: 落在 `asset` 的同名列里。只改实体名不改这一份，卡片上还写着旧名、按旧名也照样查得到，
 #: 资料页和卡片就各说各话了。
 FLAT_COLUMN = {"studio": "studio", "creator": "creator", "series": "series"}
@@ -344,7 +347,7 @@ def rewrite_flat_projection(connection: Connection, kind: str, entity_id: int,
                            (new_name, old_name))
         return connection.execute("SELECT changes()").fetchone()[0]
     rewritten = 0
-    old_tag, new_tag = f"演员:{old_name}", f"演员:{new_name}"
+    old_tag, new_tag = PERFORMER_TAG_PREFIX + old_name, PERFORMER_TAG_PREFIX + new_name
     for item in connection.execute(
         "SELECT DISTINCT asset_id FROM asset_entity WHERE entity_id=?", (entity_id,)
     ):
@@ -458,10 +461,10 @@ def merge_entity(
     改指 target，链条始终只有一跳；`resolve_entity_id` 按它把旧 id 解析到 target。
     """
     if source_id == target_id:
-        raise ValueError("不能合并到同一份档案")
+        raise UserValueError("errors.entities.mergeIntoSelf")
     target = connection.execute("SELECT kind FROM entity WHERE id=?", (target_id,)).fetchone()
     if target is None:
-        raise ValueError(f"合并目标档案 {target_id} 不存在")
+        raise UserValueError("errors.entities.mergeTargetMissing", {"id": target_id})
     target_kind = str(target[0])
     stamp = now or datetime.now(timezone.utc).isoformat()
     moved = {"assets": 0, "aliases": 0, "refs": 0, "links": 0, "terms": 0,
@@ -492,6 +495,9 @@ def merge_entity(
         " FROM asset_entity WHERE entity_id=?", (target_id, source_id))
     moved["assets"] = connection.execute("SELECT changes()").fetchone()[0]
     connection.execute("DELETE FROM asset_entity WHERE entity_id=?", (source_id,))
+    # 用户从某部片上删掉的这个人，并入之后在那部片上照样算删掉。
+    from .item_edit import rekey_removals
+    rekey_removals(connection, source_id=source_id, target_id=target_id)
 
     before = connection.execute(
         "SELECT count(*) FROM entity_external_ref WHERE entity_id=?", (source_id,)).fetchone()[0]
@@ -704,11 +710,13 @@ def _creator_attribution_rejected(connection, names, asset_id, path) -> bool:
 
 def _creator_ingest_identity(connection, name, asset_id):
     """已有账号承接集合目录；已确认厂牌不进入发布账号关系。"""
-    from .classification import creator_collection_base, creator_release_identifier
+    from .classification import creator_collection_base, creator_release_identifier, strip_enhancement_suffix
     asset = connection.execute('SELECT path,name,code FROM asset WHERE id=?',(asset_id,)).fetchone()
     if asset and creator_release_identifier(name,path=asset[0] or '',filename=asset[1] or '',code=asset[2])[0] == 'release_identifier':
         return ''
     original = name
+    # 视频增强模型代号（`_prob4`、` chf3`）从来不属于账号名，不必等同名账号存在就去掉。
+    name = strip_enhancement_suffix(name)
     base = creator_collection_base(name)
     if base != name:
         held = connection.execute("SELECT canonical_name FROM entity WHERE kind='creator' AND normalized_name=?",
@@ -733,14 +741,11 @@ def _creator_ingest_identity(connection, name, asset_id):
 
 
 def _entity_metadata_payload(connection, entity_id: int, kind: str, payload: str) -> str:
-    """来源资料更新保留用户标签决定与公司档案。"""
-    if kind not in {'tag', 'studio', 'agency'}:
-        return payload
+    """来源资料更新保留用户写下的键（`user_` 开头：标签决定、自建标记）与公司档案。"""
     held = connection.execute('SELECT metadata_json FROM entity WHERE id=?', (entity_id,)).fetchone()
-    previous, incoming = json.loads(held[0] or '{}'), json.loads(payload)
-    if kind == 'tag':
-        incoming.update({key: value for key, value in previous.items() if key.startswith('user_tag_')})
-    elif 'company_profile' in previous:
+    previous, incoming = json.loads((held[0] if held else None) or '{}'), json.loads(payload)
+    incoming.update({key: value for key, value in previous.items() if key.startswith('user_')})
+    if kind in {'studio', 'agency'} and 'company_profile' in previous:
         incoming['company_profile'] = previous['company_profile']
     return json.dumps(incoming, ensure_ascii=False)
 

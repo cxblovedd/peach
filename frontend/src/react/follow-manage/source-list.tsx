@@ -46,18 +46,23 @@ import { EmptyState } from '../components/empty-state';
 import { clickedBlank } from '../components/row-click';
 import { Note } from '../components/note';
 import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
+import { runBulkAction, type BulkAction, type Receipt } from '../components/bulk-action';
+import { exitPageSelection } from '../components/page-selection';
 import { SelectionDock } from '../components/selection-dock';
 import { busyProps } from '../settings/use-action';
 import {
   authorGroups, authorName, checkedText, checkEvidenceGap, checkFailures, checkReceipt, checkSummary,
   COLUMN_SORT, dropSources, errorHeadline, fetchCheckJob, FOLLOW_CHECK_KEY, isBroken,
-  LAYOUTS, markAllPending, pageWindow, patchSource, removeSource,
+  LAYOUTS, markAllPending, pageWindow, patchSource, removeSource, unmarkItems,
   reloadFollowManage, selectionState, setSourceEnabled, SORT_DEFAULT_DIR, SORT_OPTIONS,
   sortLabel, startCheck, tableRows, toggleGroup,
   type CheckJob, type FollowData, type FollowSource, type Layout, type SortDir, type SortKey,
   type TableRow as SourceTableRow,
 } from './follow-manage';
 import { AuthorAvatar, ErrorLine, SourceIcon, SourceLink, StatusBadge } from './source-view';
+import { codedText, jobText } from '../../core/server-text';
+import { FOLLOW_CHECK_TASK } from '../../running-tasks';
 import { joinList, t } from '../../i18n';
 
 const sourceTableFeatures = tableFeatures({
@@ -131,7 +136,7 @@ export interface SourceListProps {
   onLayout(layout: Layout): void;
   onPageSize(size: number): void;
   onSelected(next: Set<number>): void;
-  toast(message: string): void;
+  toast: Receipt;
   openFollow(): void;
   onAdd(): void;
 }
@@ -164,7 +169,7 @@ function SourceRow(
           <span aria-hidden className="w-4 shrink-0" />
           <span className="flex min-w-0 grow gap-1.5">
             <span aria-hidden className="w-(--icon-inline) shrink-0 text-body-medium" />
-            <span className="min-w-0 grow"><ErrorLine text={source.last_error} /></span>
+            <span className="min-w-0 grow"><ErrorLine text={codedText(source, 'last_error')} /></span>
           </span>
         </span>
       ) : null}
@@ -269,12 +274,13 @@ export function SourceList(props: SourceListProps) {
 
   const { job, running, outcome, start: check } = useBackgroundJob<CheckJob, number[]>({
     queryKey: FOLLOW_CHECK_KEY,
+    taskKey: FOLLOW_CHECK_TASK,
     queryFn: ({ signal }) => fetchCheckJob(signal),
     start: (ids) => startCheck(ids),
     onError: (cause) => setProblem(errorMessage(cause)),
     onFinish: (state) => {
       void reloadFollowManage();
-      toast(state.status === 'failed' ? (state.error || t('follow:followCheck.checkFailed')) : checkReceipt(state));
+      toast(state.status === 'failed' ? (jobText(state, 'error') || t('follow:followCheck.checkFailed')) : checkReceipt(state));
     },
   });
 
@@ -335,8 +341,6 @@ export function SourceList(props: SourceListProps) {
         return;
       }
       setProblem('');
-      const done = result.action === 'remove' ? 'follow:sourceList.bulkDeleted' : result.action === 'enabled' ? 'follow:sourceList.bulkEnabled' : 'follow:sourceList.bulkPaused';
-      toast(t(done, { count: result.done.length }));
     },
     onError: (cause) => setProblem(errorMessage(cause)),
   });
@@ -351,10 +355,49 @@ export function SourceList(props: SourceListProps) {
         return;
       }
       setProblem('');
-      toast(t('follow:sourceList.bulkMarked', { count: result.total }));
     },
     onError: (cause) => setProblem(errorMessage(cause)),
   });
+
+  /* 批量动作：启用、暂停与「全部标记」都能原样改回去；删除撤不回，弹窗写明。 */
+  const host = { receipt: toast, failure: (cause: unknown) => setProblem(errorMessage(cause)) };
+  const enableMany = (enable: boolean): BulkAction<number> => ({
+    key: enable ? 'enable' : 'pause', label: enable ? t('follow:shared.enable') : t('follow:shared.pause'), reversal: 'undo',
+    confirm: (ids) => ({ title: enable ? t('follow:sourceList.enableMany') : t('follow:sourceList.pauseMany'),
+      body: t(enable ? 'follow:sourceList.enableManyBody' : 'follow:sourceList.pauseManyBody', { count: ids.length }) }),
+    run: async (ids) => {
+      const flipped = ids.filter((id) => sources.find((source) => source.id === id)?.enabled !== enable);
+      const { done } = await bulk.mutateAsync({ ids: flipped, action: enable ? 'enabled' : 'paused' });
+      return async () => {
+        await mapLimit(done, 4, (id: number) => setSourceEnabled(id, !enable));
+        for (const id of done) patchSource(id, { enabled: !enable });
+      };
+    },
+    receipt: (ids) => t(enable ? 'follow:sourceList.bulkEnabled' : 'follow:sourceList.bulkPaused', { count: ids.length }),
+  });
+  const deleteMany: BulkAction<number> = {
+    key: 'delete', label: t('follow:shared.delete'), reversal: 'irreversible', danger: true,
+    confirm: (ids) => ({ title: t('follow:sourceList.deleteManyTitle', { count: ids.length }), danger: true,
+      body: t('follow:sourceList.deleteManyBody'), confirmLabel: t('follow:sourceList.deleteSelected') }),
+    run: async (ids) => { await bulk.mutateAsync({ ids: [...ids], action: 'remove' }) },
+    receipt: (ids) => t('follow:sourceList.bulkDeleted', { count: ids.length }),
+  };
+  /* 「全部标记」作用于全部未看条目，条目在写入那一刻才取齐；撤销把标上的那些改回未看。 */
+  const markEverything = (to: 'seen' | 'ignored'): BulkAction<number> => {
+    let marked: number[] = [];
+    return {
+      key: `mark-${to}`, label: to === 'seen' ? t('follow:sourceList.markAllWatched') : t('follow:sourceList.ignoreAll'), reversal: 'undo',
+      confirm: ([count]) => to === 'seen'
+        ? { title: t('follow:followDetail.markSeen'), body: t('follow:sourceList.markWatchedBody', { count }) }
+        : { title: t('follow:sourceList.markIgnored'), body: t('follow:sourceList.markIgnoredBody', { count }),
+            recovery: t('shell:batchFollow.ignoreRecovery') },
+      run: async () => {
+        marked = (await markAll.mutateAsync(to)).marked;
+        return async () => { await unmarkItems(marked); await reloadFollowManage() };
+      },
+      receipt: () => t('follow:sourceList.bulkMarked', { count: marked.length }),
+    };
+  };
 
   const toggleSourceRow = (source: FollowSource, enabled: boolean) =>
     toggleEnabled.mutate({ id: source.id, enabled });
@@ -403,7 +446,7 @@ export function SourceList(props: SourceListProps) {
         cell: (context) => (
           <span className="flex min-w-0 flex-col gap-0.5">
             <SourceLink source={context.row.original.source} />
-            {context.row.original.source.last_error ? <ErrorLine text={context.row.original.source.last_error} /> : null}
+            {context.row.original.source.last_error ? <ErrorLine text={codedText(context.row.original.source, 'last_error')} /> : null}
           </span>
         ),
       }),
@@ -575,7 +618,7 @@ export function SourceList(props: SourceListProps) {
 
       {/* 这一趟在后台跑，关掉页面还在继续，所以状态留在页面上而不是只让按钮转一下。 */}
       <div aria-live="polite" className="flex flex-col gap-3 empty:hidden">
-        {running ? <TaskProgress embedded label={job?.message || (job?.total
+        {running ? <TaskProgress embedded kind={job?.older ? activityKind('feed-scrape') : activityKind('follow-check')} label={jobText(job) || (job?.total
           ? t(job.older ? 'follow:sourceList.backfillProgress' : 'follow:sourceList.checkProgress', { checked: job.checked || 0, count: job.total })
           : t('follow:sourceList.preparingCheck'))} value={job?.checked} total={job?.total} /> : null}
         {problem ? <Note tone="error" title={t('follow:shared.actionFailed')}>{problem}</Note> : null}
@@ -597,21 +640,12 @@ export function SourceList(props: SourceListProps) {
         {evidence ? <Note tone="warning">{t('follow:sourceList.evidenceGap', { error: evidence })}</Note> : null}
       </div>
 
-        <SelectionDock label={t('follow:sourceList.bulkActions')} visible={chosen.length > 0} count={t('follow:sourceList.selectedCount', { count: chosen.length })}>
-          <Button variant="secondary" size="small" disabled={readOnly}
-            {...busyProps(rowHandlers.busy)} onClick={() => startChecking(chosen)}>{t('follow:sourceList.checkSelected')}</Button>
-          <Button variant="secondary" size="small" disabled={readOnly} {...busyProps(bulk.isPending)}
-            onClick={() => bulk.mutate({ ids: chosen, action: 'enabled' })}>{t('follow:shared.enable')}</Button>
-          <Button variant="secondary" size="small" disabled={readOnly} {...busyProps(bulk.isPending)}
-            onClick={() => bulk.mutate({ ids: chosen, action: 'paused' })}>{t('follow:shared.pause')}</Button>
-          <Button variant="danger" size="small" disabled={readOnly} {...busyProps(bulk.isPending)}
-            onClick={() => void confirmModal({
-              title: t('follow:sourceList.deleteManyTitle', { count: chosen.length }),
-              body: t('follow:sourceList.deleteManyBody'),
-              confirmLabel: t('follow:sourceList.deleteSelected'), danger: true,
-              onConfirm: () => bulk.mutateAsync({ ids: chosen, action: 'remove' }),
-            })}>{t('follow:shared.delete')}</Button>
-          <Button variant="ghost" size="small" onClick={() => onSelected(new Set())}>{t('follow:shared.clearSelection')}</Button>
+        <SelectionDock label={t('follow:sourceList.bulkActions')} visible={chosen.length > 0} count={t('follow:sourceList.selectedCount', { count: chosen.length })}
+          actions={[enableMany(true), enableMany(false), deleteMany].map((bulkAction) => ({
+            action: bulkAction, items: chosen, host, disabled: readOnly || bulk.isPending }))}
+          leading={<Button variant="secondary" size="small" disabled={readOnly}
+            {...busyProps(rowHandlers.busy)} onClick={() => startChecking(chosen)}>{t('follow:sourceList.checkSelected')}</Button>}>
+          <Button variant="ghost" size="small" onClick={exitPageSelection}>{t('follow:shared.clearSelection')}</Button>
         </SelectionDock>
 
       {asTable ? (
@@ -692,16 +726,11 @@ export function SourceList(props: SourceListProps) {
             {t('follow:sourceList.markSummary', { unwatched: Number(counts.new) || 0, watched: Number(counts.seen) || 0, saved: Number(counts.saved) || 0, ignored: Number(counts.ignored) || 0 })}
           </span>
           <Button variant="secondary" size="small" onClick={openFollow}>{t('follow:sourceList.seeUpdates')}</Button>
-          <Button variant="secondary" size="small" disabled={readOnly} {...busyProps(markAll.isPending)}
-            onClick={() => void confirmModal({
-              title: t('follow:followDetail.markSeen'), body: t('follow:sourceList.markWatchedBody'), confirmLabel: t('follow:followDetail.markSeen'),
-              onConfirm: () => markAll.mutateAsync('seen'),
-            })}>{t('follow:sourceList.markAllWatched')}</Button>
-          <Button variant="secondary" size="small" disabled={readOnly} {...busyProps(markAll.isPending)}
-            onClick={() => void confirmModal({
-              title: t('follow:sourceList.markIgnored'), body: t('follow:sourceList.markIgnoredBody'), confirmLabel: t('follow:sourceList.markIgnored'),
-              onConfirm: () => markAll.mutateAsync('ignored'),
-            })}>{t('follow:sourceList.ignoreAll')}</Button>
+          {(['seen', 'ignored'] as const).map((to) => {
+            const mark = markEverything(to);
+            return <Button key={to} variant="secondary" size="small" disabled={readOnly} {...busyProps(markAll.isPending)}
+              onClick={() => void runBulkAction(mark, [Number(counts.new) || 0], host).catch(host.failure)}>{mark.label}</Button>;
+          })}
         </div>
       ) : null}
     </div>

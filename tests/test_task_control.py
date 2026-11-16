@@ -57,6 +57,28 @@ class TaskControlTests(unittest.TestCase):
         self.assertFalse(psutil.pid_exists(int(caught.exception.output.split()[1])))
         self.assertIsNotNone(self.children[-1].poll())
 
+    def test_reaping_returns_when_an_escaped_grandchild_still_holds_the_output_pipes(self):
+        marker = self.root / 'grandchild-pid'
+        command = [sys.executable, '-c',
+                   "import subprocess,sys; from pathlib import Path; "
+                   "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'],"
+                   "stdout=sys.stdout,stderr=sys.stderr); Path(sys.argv[1]).write_text(str(child.pid))",
+                   str(marker)]
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.children.append(process)
+        self.wait_until(lambda: process.poll() is not None and marker.is_file(), '子进程没有派出孙进程')
+        grandchild = psutil.Process(int(marker.read_text()))
+        self.addCleanup(lambda: psutil.wait_procs([grandchild], timeout=5))
+        self.addCleanup(grandchild.kill)
+        started = time.monotonic()
+        with patch.object(task_control, 'REAP_SECONDS', .5), \
+                self.assertLogs('peach.task_control', 'WARNING') as logged:
+            output = task_control._reap_process(process, None)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(output, (b'', b''))
+        self.assertTrue(grandchild.is_running())
+        self.assertIn(str(process.pid), logged.output[0])
+
     def test_stderr_activity_does_not_extend_the_stdout_idle_timeout(self):
         command = [sys.executable, '-u', '-c',
                    "import sys,time; [(print('decode error', file=sys.stderr, flush=True), time.sleep(.1)) "
@@ -361,6 +383,42 @@ class TaskControlTests(unittest.TestCase):
         job.thread.join(5)
         self.assertFalse(job.thread.is_alive())
         self.assertEqual(self.store.get(run_id).status, 'succeeded')
+
+    def test_paused_work_rereads_its_control_slowly_and_wakes_on_a_resume_from_this_process(self):
+        finish = self.event()
+        progress = []
+
+        def work(job, identity):
+            while not finish.is_set():
+                task_control.checkpoint()
+                progress.append(identity)
+                time.sleep(.01)
+            job.update(identity, status='complete')
+
+        _job, original = self.start(work)
+        self.wait_until(lambda: len(progress) >= 2)
+        run_id = original['run_id']
+        task_control.request(self.store, run_id, 'pause')
+        self.wait_until(lambda: self.state(run_id)['state'] == 'paused')
+        reads = []
+        intent = task_control.intent
+        with patch.object(task_control, 'intent', side_effect=lambda *args: reads.append(1) or intent(*args)):
+            time.sleep(1.5)
+        # 停稳之后约每秒重读一次控制文件，而不是每 0.1 秒。
+        self.assertLessEqual(len(reads), 3)
+        paused_count = len(progress)
+        resumed = time.monotonic()
+        task_control.request(self.store, run_id, 'resume')
+        self.wait_until(lambda: len(progress) > paused_count)
+        self.assertLess(time.monotonic() - resumed, .5)
+        # 别的进程写下的继续（本进程收不到叫醒）在一个重读间隔内生效。
+        task_control.request(self.store, run_id, 'pause')
+        self.wait_until(lambda: self.state(run_id)['state'] == 'paused')
+        paused_count = len(progress)
+        with update_tasks._mutex(update_tasks.state_for(self.db)):
+            task_control._request(self.store, run_id, 'resume')
+        self.wait_until(lambda: len(progress) > paused_count, timeout=task_control.PAUSED_POLL_SECONDS + 1)
+        finish.set()
 
     def test_cancel_stays_running_until_work_exits_and_rejects_a_stale_resume(self):
         entered, reach_checkpoint = self.event(), self.event()

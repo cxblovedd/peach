@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { useMutation, useQuery } from '@tanstack/react-query';
 import { cardArtwork, frameArtwork } from '@peach/card-art';
 
 import { Button } from '@/components/base/buttons/button';
 import { LinkButton } from '@/components/base/buttons/link-button';
-import { RiArrowRightLine } from '@remixicon/react';
+import { RiArrowRightLine, RiCloseLine } from '@remixicon/react';
 import { cx } from '@/utils/cx';
 
 import { apiSend, errorMessage } from '../../api';
@@ -13,12 +13,14 @@ import { Note } from '../components/note';
 import { queryClient } from '../query';
 import {
   DISCONNECTED_TEXT, fetchLibraryProcessing, LIBRARY_PROCESSING_KEY, LIBRARY_PROCESSING_URL,
-  pollInterval, processingActive, type LibraryProcessingCommand, type LibraryProcessingData,
+  processingActive, type LibraryProcessingCommand, type LibraryProcessingData,
 } from './library-processing';
 import { ProcessingActions } from './processing-actions';
 import { confirmMeteredPreviews, startPreviews } from './metered-previews';
 import { busyProps } from '../settings/use-action';
+import { jobText } from '../../core/server-text';
 import { t } from '../../i18n';
+import { appSettingsStore } from '../../appearance/settings';
 
 /** 缺图判据与卡面一致；没开流量保护的影片可抽帧，有番号的影片可补发行封面。 */
 type PreviewItem = Pick<MediaItem, 'id' | 'name' | 'medium' | 'disposal' | 'location' | 'cost' | 'code' | 'is_jav'
@@ -48,20 +50,23 @@ export function meteredPreviewIds(items: PreviewItem[], javImage: string, frames
 }
 
 /** 单独一行；`className` 交给所在布局定外边距，列表页由父级间距负责。`meteredIds` 是开了流量保护、
- *  同步不读的那一批，和可同步的那批合在同一条里，多一颗先确认再只为它们补预览的次要按钮。 */
+ *  同步不读的那一批，和可同步的那批合在同一条里，多一颗先确认再只为它们补预览的次要按钮。
+ *  条上的关闭钮写本机偏好 `completionPrompt`，网格、列表与详情里的这一条一起收起，设置里可以再打开。 */
 export function LibraryCompletionPrompt({ assetIds, meteredIds = [], onComplete, className = 'mb-4' }: {
   assetIds: number[]; meteredIds?: number[]; onComplete?(): void; className?: string;
 }) {
-  if (!assetIds.length && !meteredIds.length) return null;
+  const settings = appSettingsStore();
+  useSyncExternalStore(settings.subscribe, settings.version);
+  if (settings.value.completionPrompt === false || (!assetIds.length && !meteredIds.length)) return null;
   return <Completion assetIds={assetIds} meteredIds={meteredIds} onComplete={onComplete} className={className} />;
 }
 
 function Completion({ assetIds, meteredIds, onComplete, className }: {
   assetIds: number[]; meteredIds: number[]; onComplete?(): void; className: string;
 }) {
+  /* 只读缓存：这个键的轮询由壳里常驻的停靠栏一处驱动（`use-library-processing.ts`）。 */
   const job = useQuery({ queryKey: LIBRARY_PROCESSING_KEY,
-    queryFn: ({ signal }) => fetchLibraryProcessing(signal),
-    refetchInterval: query => pollInterval(query.state.data, true) });
+    queryFn: ({ signal }) => fetchLibraryProcessing(signal) });
   const [started, setStarted] = useState<string | null>(null);
   const [outcome, setOutcome] = useState('');
   const completed = useRef<string | null>(null);
@@ -89,7 +94,7 @@ function Completion({ assetIds, meteredIds, onComplete, className }: {
   // 运行时保留缺图数量；新范围等待当前任务结束，不隐式追加或替换。
   const busy = start.isPending || processingActive(state);
   const problem = start.error ? errorMessage(start.error) : job.error ? DISCONNECTED_TEXT
-    : started && state?.job_id === started && state.status === 'failed' ? state.error || t('manage:completionPrompt.failed') : '';
+    : started && state?.job_id === started && state.status === 'failed' ? jobText(state, 'error') || t('manage:completionPrompt.failed') : '';
   const later = processingActive(state) ? t('manage:completionPrompt.afterCurrentTask') : '';
   const total = new Set([...assetIds, ...meteredIds]).size;
   const metered = meteredIds.length;
@@ -105,6 +110,7 @@ function Completion({ assetIds, meteredIds, onComplete, className }: {
     start.mutate('metered');
   };
   const blocked = state?.metadata_only ? t('manage:completionPrompt.previewsDisabled') : '';
+  const dismiss = () => { const settings = appSettingsStore(); settings.value.completionPrompt = false; settings.save() };
   // 主按钮在最右：两批都有时「同步这些影片」是主操作，流量保护那批是它左边的次要按钮。
   return <section aria-label={t('manage:completionPrompt.regionLabel')} aria-live="polite" data-library-completion="" className={cx('@container', className)}>
     <Note tone={problem ? 'warning' : 'neutral'} action={<div className="flex flex-wrap items-center gap-2">
@@ -116,6 +122,8 @@ function Completion({ assetIds, meteredIds, onComplete, className }: {
         setOutcome('');
         start.mutate(command);
       }} /> : null}
+      <Button variant="ghost" size="small" iconOnly leadingIcon={RiCloseLine} data-completion-dismiss=""
+        aria-label={t('manage:completionPrompt.dismiss')} title={t('manage:completionPrompt.dismiss')} onClick={dismiss} />
     </div>}>
       {message}{' '}<LinkButton href="/data-cleanup#libraryProcessing" size="small" trailingIcon={RiArrowRightLine}>
       {problem ? t('manage:completionPrompt.openScanFetch') : t('manage:completionPrompt.viewDetails')}

@@ -40,6 +40,16 @@ it('无效的已保存地址保留在表单中，修正保存后清除配置提�
   expect(host.textContent).not.toContain('云下载配置需要检查');
 });
 
+it('设置块的问题带 code 时按 code 取当前语言的文字，没有 code 的照原文', async () => {
+  const host = await mount(<DownloadSettings initial={{
+    ...state(), problems: ['旧版服务端的原句', '只有原文的一句'],
+    problem_codes: [{ code: 'labels.downloadsChannels.clouddriveTokenUnreadable', params: {} }, { code: '', params: {} }],
+  } as DownloadSettingsState} receipt={vi.fn()} />);
+  expect(host.textContent).toContain('CloudDrive2 令牌无法读取，请重新填写。');
+  expect(host.textContent).not.toContain('旧版服务端的原句');
+  expect(host.textContent).toContain('只有原文的一句');
+});
+
 const unfilled = () => state({
   config: { clouddrive_address: 'http://127.0.0.1:19798', targets: {}, pikpak_root: '', wait_hours: 168 },
   pikpak_roots: ['A:\\'],
@@ -199,6 +209,20 @@ it('在账号框里填了 PikPak 账号或已登录时，检查才问 PikPak 根
   await click(buttonNamed('检查连接', signedIn));
   await settle();
   expect(sentBody(fetcher, 1)).toMatchObject({ pikpak_account: true });
+});
+
+it('PikPak 没登录、也没填账号时根目录变灰，填了账号或已登录就能选；目标目录始终可填', async () => {
+  vi.stubGlobal('fetch', fetchMock(200, report()));
+  const root = (host: HTMLElement) => host.querySelector<HTMLButtonElement>('button[aria-haspopup="listbox"][aria-label*="PikPak"]');
+  const disabled = (button: HTMLButtonElement | null) => !!button && (button.disabled || button.hasAttribute('data-disabled'));
+  const host = await mount(<DownloadSettings initial={state()} receipt={vi.fn()} />);
+  expect(disabled(root(host))).toBe(true);
+  expect(field(host, 'PikPak 目标目录')?.disabled).toBe(false);
+  await type(field(host, '账号'), 'me@example.com');
+  expect(disabled(root(host))).toBe(false);
+  const signedIn = await mount(<DownloadSettings receipt={vi.fn()}
+    initial={state({ pikpak: { logged_in: true, username: 'me@example.com', remember: false, method: 'password' } })} />);
+  expect(disabled(root(signedIn))).toBe(false);
 });
 
 it('推出的目录不存在时标成无效，点了「新建这个目录」才去建，建好后解除', async () => {

@@ -17,11 +17,13 @@ import json
 import time
 from typing import Protocol
 
-from .catalog_rules import compile_code_patterns
+from . import wants
+from .catalog_rules import CodePatternError, compile_code_patterns
 from .feeds import DEFAULT_HIDDEN_COMPILATIONS, EXCERPT, GROUP_COMPILATION, SOLO_COMPILATION
 from .media_sources import SCANNABLE_LOCATIONS
 from .remote_media_cache import AVATAR_REFRESH_SECONDS, FAVICON_REFRESH_SECONDS
 from .system_language import system_language
+from .user_messages import UserValueError
 
 from .profiles import DEFAULT_PROFILE_ID
 
@@ -59,12 +61,19 @@ INTERFACE_LANGUAGE_CHOICES = ("auto", *INTERFACE_LANGUAGES)
 #: 替哪些壳补封面都按它算，所以跟着账本走。
 #: 番号识别规则描述的是这套馆藏的命名，处理任务按它往账本里写番号，同样跟着账本走。
 #: 界面语言（ADR-0156）是用这套馆藏的那个人读的语言，每个部署只有一人，换台设备不该再选一遍。
+#: 浏览器入库没搜到资源时加不加入想要（ADR-0161）是服务端在入库队列里做的事，同样跟着账本走。
+#: 「想要」老片多久查一次、查几次放弃（`wants.cadence`）是定时查找读的，同样跟着账本走。
 SYNCED_SETTING_KEYS = frozenset({
     "sidebarOrder", "manageOrder", "navigationOrders", "libraryOrder", "followInitialDays", "postSetupTutorialDone",
     "organizeTemplates", "feedHideGroupCompilations", "feedHideSoloCompilations",
     "feedHideExcerpts", "searchHistoryLimit", "codePatterns", "performerNameLanguage", "taskSpeedMode",
-    "interfaceLanguage",
+    "interfaceLanguage", "javBrowserWantOnNoMatch", "wantStaleSearchDays", "wantStaleAttemptLimit",
 })
+#: 「想要」两项节奏设置的键、档位校验与报错 code。
+WANT_CADENCE_KEYS = (
+    ("wantStaleSearchDays", wants.normalise_stale_search_days, wants.STALE_SEARCH_DAY_CHOICES),
+    ("wantStaleAttemptLimit", wants.normalise_stale_attempt_limit, wants.STALE_ATTEMPT_LIMITS),
+)
 #: 三个收起开关的键与各自对应的那一类，缺省值取 `feeds.DEFAULT_HIDDEN_COMPILATIONS`。
 FEED_COMPILATION_SWITCHES = (
     ("feedHideGroupCompilations", GROUP_COMPILATION),
@@ -107,10 +116,10 @@ def normalise_navigation_orders(raw):
 
 def navigation_orders_patch(raw):
     if not isinstance(raw, dict) or set(raw) - NAVIGATION_ORDERS.keys():
-        raise ValueError('导航排序需要已知分组与顺序数组')
+        raise UserValueError('api.settings.navigationOrdersInvalid')
     if any(not isinstance(entries, list) or any(not isinstance(key, str) or key not in NAVIGATION_ORDERS[group]
                                                for key in entries) for group, entries in raw.items()):
-        raise ValueError('导航顺序包含无效项目')
+        raise UserValueError('api.settings.navigationOrderUnknownEntry')
     return normalise_navigation_orders(raw)
 
 
@@ -203,10 +212,13 @@ def organize_templates(contract: SettingsContract) -> dict:
 def normalise_code_patterns(raw) -> list[str]:
     """收敛番号识别规则：一组正则，去掉空行。
 
-    存之前就编译一遍：写错的规则在保存那一刻报给用户（`ValueError`，API 翻成 400），
+    存之前就编译一遍：写错的规则在保存那一刻报给用户（带 code 的 `UserValueError`，API 翻成 400），
     不等到下一次处理时才在后台悄悄失效。
     """
-    compile_code_patterns(raw)
+    try:
+        compile_code_patterns(raw)
+    except CodePatternError as error:
+        raise UserValueError(error.code, error.params) from None
     return [str(rule).strip() for rule in raw or () if str(rule or "").strip()]
 
 
@@ -248,6 +260,7 @@ def _stored(contract: SettingsContract) -> dict:
 def q_settings(contract: SettingsContract, _args=None) -> dict:
     """读取跟人走的那部分设置。缺省时返回默认值，不返回空。"""
     payload = _stored(contract)
+    cadence = wants.cadence_from(payload)
     return {
         "sidebarOrder": normalise_sidebar_order(payload.get("sidebarOrder")),
         **({"manageOrder": normalise_manage_order(payload["manageOrder"])} if "manageOrder" in payload else {}),
@@ -265,7 +278,23 @@ def q_settings(contract: SettingsContract, _args=None) -> dict:
         "interfaceLanguage": payload["interfaceLanguage"] if payload.get("interfaceLanguage") in INTERFACE_LANGUAGE_CHOICES else "auto",
         "systemLanguage": system_language(),
         "taskSpeedMode": payload.get("taskSpeedMode", "standard"),
+        "javBrowserWantOnNoMatch": payload.get("javBrowserWantOnNoMatch") is not False,
+        "wantStaleSearchDays": cadence.stale_every.days,
+        "wantStaleAttemptLimit": cadence.attempt_limit,
     }
+
+
+def _want_cadence_patch(body):
+    """「想要」两项节奏设置：只收列出的档位，不在档位里的值整次拒收。"""
+    patch = {}
+    for key, normalise, choices in WANT_CADENCE_KEYS:
+        if key in body:
+            value = normalise(body[key])
+            if value is None:
+                raise UserValueError("api.settings.choiceInvalid",
+                                     {"key": key, "choices": "/".join(map(str, choices))})
+            patch[key] = value
+    return patch
 
 
 def _navigation_patch(body):
@@ -277,7 +306,7 @@ def _navigation_patch(body):
         if (not isinstance(order, list) or len(order) > 1000
                 or any(not isinstance(key, str) or not key or len(key) > 120 for key in order)
                 or len(set(order)) != len(order)):
-            raise ValueError("媒体库顺序须使用不重复的媒体库 ID")
+            raise UserValueError("api.settings.libraryOrderInvalid")
         patch["libraryOrder"] = order
     return patch
 
@@ -292,23 +321,25 @@ def w_settings(contract: SettingsContract, body) -> dict:
         raise TypeError("settings body must be an object")
     unknown = set(body) - SYNCED_SETTING_KEYS
     if unknown:
-        raise ValueError(f"这些设置不跟数据库同步：{sorted(unknown)}")
+        raise UserValueError("api.settings.unknownKeys", {"keys": str(sorted(unknown))})
     if not body:
-        raise ValueError("没有要写入的设置")
+        raise UserValueError("api.settings.empty")
 
     merged = _stored(contract)
     merged.update(_navigation_patch(body))
+    merged.update(_want_cadence_patch(body))
     if "taskSpeedMode" in body:
         from .processing_control import valid_mode
         merged["taskSpeedMode"] = valid_mode(body["taskSpeedMode"])
     if "performerNameLanguage" in body:
         language = body["performerNameLanguage"]
         if language not in ("zh-CN", "ja"):
-            raise ValueError("performerNameLanguage 只收 zh-CN 或 ja")
+            raise UserValueError("api.settings.performerNameLanguageInvalid")
         merged["performerNameLanguage"] = language
     if "interfaceLanguage" in body:
         if body["interfaceLanguage"] not in INTERFACE_LANGUAGE_CHOICES:
-            raise ValueError("interfaceLanguage 只收 " + "、".join(INTERFACE_LANGUAGE_CHOICES))
+            raise UserValueError("api.settings.interfaceLanguageInvalid",
+                                 {"choices": "、".join(INTERFACE_LANGUAGE_CHOICES)})
         merged["interfaceLanguage"] = body["interfaceLanguage"]
     if "manageOrder" in body:
         merged["manageOrder"] = normalise_manage_order(body["manageOrder"])
@@ -325,12 +356,12 @@ def w_settings(contract: SettingsContract, body) -> dict:
     if "searchHistoryLimit" in body:
         limit = normalise_search_history_limit(body["searchHistoryLimit"])
         if limit is None:
-            raise ValueError(f"searchHistoryLimit 只收 0 到 {SEARCH_HISTORY_LIMIT_MAX} 的整数")
+            raise UserValueError("api.settings.searchHistoryLimitInvalid", {"max": SEARCH_HISTORY_LIMIT_MAX})
         merged["searchHistoryLimit"] = limit
-    for key, _kind in FEED_COMPILATION_SWITCHES:
+    for key in [key for key, _kind in FEED_COMPILATION_SWITCHES] + ["javBrowserWantOnNoMatch"]:
         if key in body:
             if not isinstance(body[key], bool):
-                raise ValueError(f"{key} 只收 true 或 false")
+                raise UserValueError("api.settings.switchNotBoolean", {"key": key})
             merged[key] = body[key]
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with contract.write_transaction() as connection:
@@ -350,5 +381,5 @@ def w_settings(contract: SettingsContract, body) -> dict:
             (json.dumps(current, ensure_ascii=False), stamp, DEFAULT_PROFILE_ID),
         ).rowcount
         if not updated:
-            raise ValueError(f"profile {DEFAULT_PROFILE_ID} 不存在")
+            raise UserValueError("api.settings.profileMissing", {"profile": DEFAULT_PROFILE_ID})
     return {"ok": True, **q_settings(contract)}

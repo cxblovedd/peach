@@ -3,8 +3,8 @@ import { followState } from './follow.js';
 import { managementSkeletonHtml, pageSkeletonHtml, skeletonKeyOf } from './../management-placeholder';
 import { photoSize } from './../appearance/layout';
 import { $, ROUTE_ENTITIES } from '../core';
-import { fitSkeleton, LOAD_MORE_STATUS, loadingDotsHtml, revealSkeleton } from '../ui-kit';
-import { junkCountSkeletonHtml, junkRoute } from './../junk-queue';
+import { activityStatusHtml, fitSkeleton, LOAD_MORE_STATUS, revealSkeleton } from '../ui-kit';
+import { junkCountSkeletonHtml, junkRoute, junkSelectAllSkeletonHtml } from './../junk-queue';
 import { state, presentedItem } from './../shell/index';
 import { homeRouteLabel, mediaRouteLabel, postRouteLabel } from '../history/page-title';
 import { subscribeNames } from '../core/entity-names';
@@ -46,9 +46,11 @@ export function renderCatalogLoading(label=t('shell:skeleton.loadingVideos')){
   $('#loadSentinel').hidden=true;
   /* 网格已经画着（或首屏在途）时骨架归它自己铺：`#grid` 是它的容器，壳往里写会把页面冲掉。 */
   if(gridTaken())return;
-  const grid=$('#grid'),placeholder=catalogSkeletonHtml(label);
+  /* 垃圾文件的网格上面压着一行「全选」：骨架连同它占满一整行，首张卡与落地同位。 */
+  const cards=catalogSkeletonHtml(label);
+  const grid=$('#grid'),placeholder=junk?`<div style="grid-column:1/-1;min-width:0">${junkSelectAllSkeletonHtml()}${cards}</div>`:cards;
   const skeleton=grid.querySelector('.catalog-skeleton');
-  if(skeleton?.dataset.skeleton===skeletonKeyOf(placeholder)
+  if(skeleton?.dataset.skeleton===skeletonKeyOf(placeholder)&&!!grid.querySelector('[data-junk-select-all]')===junk
     &&Number(skeleton.querySelector('[style]')?.style.getPropertyValue('--skeleton-card-ratio'))===catalogCardRatio())return;
   if(skeleton)grid.innerHTML=`<div class="grid">${placeholder}</div>`;
   else loadingState.setGridCards(placeholder);
@@ -143,7 +145,7 @@ followState.followSkeletonHtml = (label=t('shell:skeleton.loadingFollowing'))=>`
     <div class="tagbar followfilters" data-filter-row="top" data-skeleton-tier="pill"></div>
     <div class="count followcount" data-filter-row="bottom"><span class="mono"><span class="countskeleton"></span></span></div></div>
   ${followState.followContentSkeletonHtml(undefined,label)}</div></div>`;
-$('#loadSentinel').innerHTML=loadingDotsHtml(LOAD_MORE_STATUS);
+$('#loadSentinel').innerHTML=activityStatusHtml('linear-dots', LOAD_MORE_STATUS);
 loadingState.setGridCards = html=>revealSkeleton($('#grid'),()=>{$('#grid').innerHTML=`<div class="grid">${html}</div>`});
 loadingState.gridCards = ()=>document.querySelectorAll(
     ':is(#grid,#index [data-entity-grid]) :is([data-media-grid] > [data-media-card][data-id],[data-catalog-row][data-id])');

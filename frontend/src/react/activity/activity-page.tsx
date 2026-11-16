@@ -24,11 +24,11 @@ import { cardClass } from '../components/card';
 import { CodeBlock } from '../components/code-block';
 import { EmptyState } from '../components/empty-state';
 import { IssueRow } from '../components/issue-row';
-import { LoadingDots } from '../components/loading-dots';
 import { NameLink } from '../components/name-link';
 import { Note } from '../components/note';
 import { Page } from '../components/page';
-import { Progress } from '../components/progress';
+import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { DataTableFooter } from '../components/table-controls';
 import { Disclosure } from '../settings/section';
 import { BackgroundIssues } from './background-issues';
@@ -39,10 +39,16 @@ import { TaskIcon } from './task-icon';
 import { TaskResources } from './task-resources';
 import {
   elapsedText, fetchTasks, foldByKind, foldRoutine, followupDetail, followupTally, groupFollowups, isActive,
-  hasResultProblems, isRoutine, latestOfKind, momentText, pollInterval, problemDestination, progressText,
+  hasResultProblems, isRoutine, latestOfKind, momentText, pollInterval, problemDestination, progressText, RUNNING_POLL_MS,
   progressLabel, readableErrorHeadline, runError, statusLabel, summaryItems, taskIssues, taskName, taskSubject, TASKS_KEY, TRIGGER_LABELS, type FollowupCounts, type TaskControlState, type TaskRunPayload,
 } from './tasks';
+import { withBackoff } from '../../polling';
 import { t } from '../../i18n';
+
+/** 整页那一份：有东西在跑两秒、全是终态十秒，读失败按 4、8、16、30 秒退避。 */
+const tasksInterval = withBackoff(pollInterval);
+/** 展开的后继明细：有在跑的才问，失败同样退避。 */
+const followupsInterval = (active: boolean | undefined) => withBackoff(() => (active ? RUNNING_POLL_MS : false));
 
 /** 自己只负责派发后继的任务：一轮只是「安排了几项」，要看的是那几项的结果。 */
 const DISPATCHERS = new Set(['upgrade-repairs']);
@@ -140,7 +146,7 @@ function RunCard(
         apiGet<{ followups: TaskRunPayload[] }>(`/api/tasks/${id}`, signal)));
       return snapshots.flatMap((snapshot) => snapshot.followups);
     },
-    refetchInterval: resourceActive ? 2000 : false,
+    refetchInterval: followupsInterval(resourceActive),
   });
   const rank = (row: TaskRunPayload) => (row.status === 'running' ? 3 : row.status === 'pending' ? 2
     : row.status === 'failed' || row.status === 'interrupted' ? 1 : 0);
@@ -221,13 +227,12 @@ function RunningRun({ run, followups, followupTotal }:
     .filter(Boolean).join(' · ');
   return (
     <RunCard run={run} meta={meta} followups={followups} followupTotal={followupTotal}>
-      {total > 0
-        ? <div className="flex flex-col gap-1.5">
-            <Progress label={label} value={Math.min(current, total)} max={total} />
-            <p className="text-caption-1-regular text-text-secondary wrap-anywhere">{label} · {t('manage:taskCenter.progressItems', { progress: progressText(current, total) })}</p>
-          </div>
-        : stopping ? <p data-copy-key={`tasks.control.state.${control}`}
-            className="text-caption-1-regular text-text-secondary">{label}</p> : <LoadingDots label={label} />}
+      {/* 暂停、取消这些控制态不是在推进：有总量照画停住的横条，没有总量只写状态，不画动画。 */}
+      {stopping && !(total > 0) ? <p data-copy-key={`tasks.control.state.${control}`}
+            className="text-caption-1-regular text-text-secondary">{label}</p>
+        : <TaskProgress embedded kind={activityKind(run.task_key, String(run.progress_params?.stage || '') || null)}
+            label={total > 0 ? `${label} · ${t('manage:taskCenter.progressItems', { progress: progressText(current, total) })}` : label}
+            value={Math.min(current, total)} total={total} />}
     </RunCard>
   );
 }
@@ -323,12 +328,8 @@ function WorkingRun(
   return (
     <RunCard run={run} meta={meta} followups={followups} followupTotal={total} resourceActive controlled={runs}
       badge={run.control ? <StatusBadge run={run} /> : <Chip color="blue">{t('manage:taskStatus.running')}</Chip>}>
-      <div className="flex flex-col gap-1.5">
-        <Progress label={t('manage:taskCenter.taskProgress', { task: taskName(run) })} value={settled} max={total} />
-        <p className="text-caption-1-regular text-text-secondary">
-          {t('manage:taskCenter.processedProgress', { progress: progressText(settled, total) })}{failed ? t('manage:taskCenter.failedSuffix', { count: failed }) : ''}
-        </p>
-      </div>
+      <TaskProgress embedded kind={activityKind(run.task_key)} value={settled} total={total}
+        label={`${t('manage:taskCenter.processedProgress', { progress: progressText(settled, total) })}${failed ? t('manage:taskCenter.failedSuffix', { count: failed }) : ''}`} />
     </RunCard>
   );
 }
@@ -363,7 +364,7 @@ export function ActivityPage() {
   const tasks = useQuery({
     queryKey: page === 1 && pageSize === 20 ? TASKS_KEY : [...TASKS_KEY, 'page', page, pageSize],
     queryFn: ({ signal }) => fetchTasks(signal, page, pageSize),
-    refetchInterval: (query) => pollInterval(query.state.data),
+    refetchInterval: tasksInterval,
     placeholderData: (previous) => previous,
   });
   const [lastData, setLastData] = useState(tasks.data);

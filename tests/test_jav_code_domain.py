@@ -33,6 +33,7 @@ from pathlib import Path
 from peach.catalog_rules import (
     CODE_BODY_STOPWORDS,
     REPOST_SITE_LABELS,
+    CodePatternError,
     code_query_variants,
     compact_label,
     compile_code_patterns,
@@ -417,20 +418,48 @@ class TokyoHotShapeTests(unittest.TestCase):
             name = f'MKBD{separator}S94-C 作品标题.mkv'
             self.assertEqual(jav_display_metadata(name, 'MKBD-S94'), {
                 'display_code': 'MKBD-S94', 'display_title': '作品标题',
-                'edition_badges': ['中字', '无码']})
+                'edition_badges': ['chinese-subtitles', 'uncensored']})
         self.assertEqual(jav_fallback_title('MKD-S118.mp4', 'MKD-S118'), '')
+
+    def test_registered_digit_labels_reach_every_code_entrypoint(self):
+        """TMA 的 `T28`、`T38` 厂牌段带数字；只认登记过的这两段。"""
+        from peach.feeds import scan_code
+        for value in ('T38-076', 't38-076', 'T38_076', 't38076', 'T38-76', 'T38-076-C', '[98t.tv]T38-076'):
+            self.assertEqual(release_code_from_text(value), 'T38-076', value)
+            self.assertEqual(release_code_from_filename(f'{value}.mp4'), 'T38-076', value)
+        self.assertEqual(release_code_from_filename('T28-612 週に3回ハメてます.mp4'), 'T28-612')
+        self.assertEqual(scan_code('T38-076 今日、家族に売られました。'), 'T38-076')
+        self.assertEqual(scan_code('T28-612 週に3回ハメてます', product=True), 'T28-612')
+        self.assertTrue(is_jav_code('T28-612'))
+        self.assertEqual(normalise_code_key('t28_612'), 'T28-612')
+        self.assertEqual(code_query_variants('T28-612'), ('T28-612',))
+        self.assertEqual(jav_display_metadata('T38-076-C 片名.mp4', 'T38-076'), {
+            'display_code': 'T38-076', 'display_title': '片名', 'edition_badges': ['chinese-subtitles']})
+        # DMM 的 content_id 带片商数字头，和别家番号一样不与裸番号算成同一身份。
+        self.assertEqual(release_identity('t2800612'), 'T28-612')
+        self.assertEqual(release_identity('55t2800612'), '55T28-612')
+        self.assertFalse(same_release_code('T28-612', 'T38-612'))
+
+    def test_unregistered_letter_digit_labels_stay_unrecognised(self):
+        """厂牌名、画质词与素材编号同样是「字母+数字」，白名单之外一律不是番号。"""
+        for value in ('S1-123', 'G1-123', 'VR180-123', 'X1080', 'G2115', 'p1000', 'T29-123',
+                      'T-28612', 'AT28-612', 'T280-612', 'T28'):
+            self.assertIsNone(release_code_from_text(value), value)
+            self.assertIsNone(release_code_from_filename(f'{value}.mp4'), value)
+        self.assertEqual(release_code_from_filename('MIAA-636-C_X1080X.mp4'), 'MIAA-636')
+        self.assertFalse(is_jav_code('T28612'))
 
     def test_uncensored_only_labels_get_the_uncensored_badge(self):
         for name, code in (('SMBD-120.mp4', 'SMBD-120'), ('SKYHD-050-C.mp4', 'SKYHD-050')):
             with self.subTest(code=code):
-                self.assertIn('无码', jav_display_metadata(name, code)['edition_badges'])
+                self.assertIn('uncensored', jav_display_metadata(name, code)['edition_badges'])
         self.assertEqual(jav_display_metadata('MCDV-024.mp4', 'MCDV-024')['edition_badges'], [])
 
     def test_ltx_after_the_code_marks_a_cracked_edition(self):
         self.assertEqual(jav_display_metadata('ABP-123-LTX.mp4', 'ABP-123'), {
-            'display_code': 'ABP-123', 'display_title': '', 'edition_badges': ['无码破解']})
+            'display_code': 'ABP-123', 'display_title': '', 'edition_badges': ['uncensored-crack']})
         self.assertEqual(jav_display_metadata('ABP-123-C-LTX.mp4', 'ABP-123')['edition_badges'],
-                         ['中字', '无码破解'])
+                         ['chinese-subtitles', 'uncensored-crack'])
         # 字母段本身是 LTX 的番号不是破解标记。
         self.assertEqual(jav_display_metadata('LTX-123.mp4', 'LTX-123')['edition_badges'], [])
 
@@ -552,8 +581,10 @@ class TitledFilenameTests(unittest.TestCase):
         self.assertEqual(release_code_from_filename("片名 CAWD-987.mp4", patterns=loose), "CAWD-987")
 
     def test_a_broken_user_rule_says_which_one(self):
-        with self.assertRaisesRegex(ValueError, "第 2 条"):
+        with self.assertRaises(CodePatternError) as caught:
             compile_code_patterns([r"(\w+-\d+)", "(unclosed"])
+        self.assertEqual((caught.exception.code, caught.exception.params["index"]),
+                         ("errors.catalogRules.codePatternInvalid", 2))
         self.assertEqual(compile_code_patterns(None), ())
         self.assertEqual(compile_code_patterns(["", "  "]), ())
 
@@ -772,9 +803,9 @@ class AuditScriptTests(unittest.TestCase):
         self._asset(12, folder + r"\最新成人AV.gif", "HJD2048")
         rows = self._rows()
         self.assertEqual((rows[10]["proposed_code"], rows[10]["proposal_from"]),
-                         ("MIDE-612", "文件名"))
+                         ("MIDE-612", "filename"))
         self.assertEqual((rows[12]["proposed_code"], rows[12]["proposal_from"]),
-                         ("MIDE-612", "同目录兄弟"))
+                         ("MIDE-612", "siblings"))
 
     def test_two_codes_in_one_directory_leave_the_rest_unproposed(self):
         # 目录里有两部片时，兄弟证据指不出这条属于哪一部，宁可报「无番号」。
@@ -792,7 +823,7 @@ class AuditScriptTests(unittest.TestCase):
         self._asset(6, r"B:\番号\_未知厂牌\NEWSITE77\newsite77.com@SSIS-070\SSIS-070.mp4",
                     "NEWSITE77")
         row = self._rows()[6]
-        self.assertEqual((row["tier"], row["confidence"]), ("E2", "高"))
+        self.assertEqual((row["tier"], row["confidence"]), ("E2", "high"))
         self.assertEqual(row["proposed_code"], "SSIS-070")
 
     def test_a_sibling_carries_the_evidence_for_a_renamed_file(self):
@@ -801,7 +832,7 @@ class AuditScriptTests(unittest.TestCase):
                     "NEWSITE77")
         self._asset(8, r"B:\番号\_未知厂牌\NEWSITE77\SSIS-071\SSIS-071.mp4", "NEWSITE77")
         row = self._rows()[8]
-        self.assertEqual((row["tier"], row["confidence"]), ("E3", "中"))
+        self.assertEqual((row["tier"], row["confidence"]), ("E3", "medium"))
         self.assertEqual(row["proposed_code"], "SSIS-071")
         self.assertEqual(row["evidence"], "newsite77.com")
 
@@ -870,13 +901,14 @@ class ApplyTests(unittest.TestCase):
         self.assertTrue((self.root / "b.db").exists())
 
     def test_a_pack_row_is_never_written(self):
-        # `存疑` 的 269 条论坛整合包要人工看过再定，不能跟着这一批一起改。
+        # `suspect` 的 269 条论坛整合包要人工看过再定，不能跟着这一批一起改；旧版表里写「存疑」。
         self._asset(3, r"B:\x\WX17\[mtfdz.club]WX17.3\a.rar", "WX17")
-        self._plan({"asset_id": "3", "current_code": "WX17",
-                    "proposed_code": "", "tier": "存疑"})
-        with self.assertRaises(SystemExit):
-            self._run("--apply", "--backup", str(self.root / "b.db"))
-        self.assertEqual(self._codes()[3][0], "WX17")
+        for tier in ("suspect", "存疑"):
+            self._plan({"asset_id": "3", "current_code": "WX17",
+                        "proposed_code": "", "tier": tier})
+            with self.assertRaises(SystemExit):
+                self._run("--apply", "--backup", str(self.root / "b.db"))
+            self.assertEqual(self._codes()[3][0], "WX17")
 
     def test_a_row_edited_since_the_review_is_skipped_not_overwritten(self):
         # 出表和写库之间隔着一次人工阅读，期间别的脚本可能已经改过同一行。

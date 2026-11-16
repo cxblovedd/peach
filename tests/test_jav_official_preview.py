@@ -58,12 +58,30 @@ class OfficialPreviewTests(unittest.TestCase):
             200, {}, json.dumps({'data': {'ppvContent': {**item, 'sample2DMovie': None}}}).encode()))), '')
 
     def test_dmm_media_boundary_rejects_credentials_fragments_and_other_hosts(self):
-        self.assertEqual(dmm_preview_url(DMM_VIDEO), DMM_VIDEO)
+        # DMM 换过预告主机（cc3001 → tencc3001）：DMM 自己域名下的主机都认。
+        for url in [DMM_VIDEO, DMM_VIDEO.replace('cc3001.', 'tencc3001.'),
+                    'https://tencc3001.dmm.co.jp/pv/TXIzJDkq45zQjNREbc2UuietOP16/sqte738hhb.mp4']:
+            with self.subTest(url=url):
+                self.assertEqual(dmm_preview_url(url), url)
         for url in [DMM_VIDEO.replace('https:', 'http:'), DMM_VIDEO + '#fragment',
-                    DMM_VIDEO.replace('cc3001.', 'cc3001.evil.'), DMM_VIDEO.replace('https://', 'https://user:pass@'),
-                    DMM_VIDEO.replace('/pv/', '/private/'), DMM_VIDEO.replace('.mp4', '.jpg')]:
+                    DMM_VIDEO.replace('dmm.co.jp', 'dmm.co.jp.evil.test'), DMM_VIDEO.replace('cc3001.dmm', 'evildmm'),
+                    DMM_VIDEO.replace('cc3001.dmm.co.jp', 'dmm.co.jp'), DMM_VIDEO.replace('https://', 'https://user:pass@'),
+                    DMM_VIDEO.replace('/pv/', '/pv/../'), DMM_VIDEO.replace('.mp4', '.jpg')]:
             with self.subTest(url=url):
                 self.assertEqual(dmm_preview_url(url), '')
+
+    def test_an_unrecognised_dmm_address_says_so_instead_of_asking_to_retry(self):
+        """DMM 声明了预告、地址却不认时，原因不是网络：界面写出主机，日志留下原地址。"""
+        item = {'id': 'rctd00764', 'makerContentId': 'RCTD-764',
+                'sample2DMovie': {'highestMovieUrl': 'https://private.invalid/sample.mp4'}}
+        transport = Mock(return_value=HttpResponse(200, {}, json.dumps({'data': {'ppvContent': item}}).encode()))
+        with self.assertLogs('peach.jav_official_preview', 'WARNING') as logs, \
+                self.assertRaises(PublicSourceUnavailable) as raised:
+            dmm_preview('RCTD-764', Path('unused'), transport=transport)
+        self.assertEqual((raised.exception.code, raised.exception.params),
+                         ('errors.javOfficialPreview.dmmUnrecognized', {'host': 'private.invalid'}))
+        self.assertIn('private.invalid', str(raised.exception))
+        self.assertIn('https://private.invalid/sample.mp4', logs.output[0])
 
     def test_dmm_response_without_product_field_is_unavailable(self):
         with self.assertRaises(PublicSourceUnavailable):
@@ -112,7 +130,7 @@ class OfficialPreviewTests(unittest.TestCase):
     def test_preview_source_order_and_webui_fallback(self):
         mirror = 'https://jdforrepam.com/api/v1/movies/ttm3u8/preview/sample/720p.m3u8'
         for dmm, javdb, expected in [(DMM_VIDEO, '', DMM_VIDEO), ('', DMM_VIDEO, DMM_VIDEO), ('', '', mirror),
-                                     (PublicSourceUnavailable('DMM 未取得'), '', mirror)]:
+                                     (PublicSourceUnavailable('errors.javOfficialPreview.dmmUnavailable'), '', mirror)]:
             with self.subTest(dmm=dmm, javdb=javdb), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory).resolve()
                 contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
@@ -149,7 +167,7 @@ class OfficialPreviewTests(unittest.TestCase):
             contract = WebContract(fresh_ledger(root), cover_root=root / 'covers')
             self.addCleanup(contract.stop_background_jobs)
             api = PublicAPI()
-            api.movie = Mock(side_effect=PublicSourceUnavailable('WebUI 未取得'))
+            api.movie = Mock(side_effect=PublicSourceUnavailable('errors.javdbPublic.unavailable'))
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
                     patch('peach.jav_official_preview.dmm_preview', return_value=DMM_VIDEO):
                 payload = q_jav_detail(contract, {'code': 'RCTD-764'})
@@ -254,8 +272,8 @@ class OfficialPreviewTests(unittest.TestCase):
             api = PublicAPI()
             api.movie = Mock(return_value={'number': 'EXM-001', 'id': 'Exact', 'maker_name': 'Prestige'})
             with patch('peach.web_jav_detail.PUBLIC_API', api), \
-                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('预告连接未取得')):
+                    patch('peach.jav_official_preview.prestige_preview', side_effect=PublicSourceUnavailable('errors.javOfficialPreview.officialUnavailable')):
                 payload = q_jav_detail(contract, {'code': 'EXM-001'})
             self.assertEqual(payload['state'], 'ready')
             self.assertEqual(payload['preview_state'], 'unavailable')
-            self.assertIn('预告连接未取得', payload['message'])
+            self.assertIn('官方视频预览未取得', payload['message'])

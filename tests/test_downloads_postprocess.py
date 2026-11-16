@@ -72,7 +72,7 @@ class DownloadPostprocessTests(unittest.TestCase):
         from peach.task_retry import RETRY_DELAYS
         started = 1_800_000_000.0
         self.contract.downloads.clock = lambda: started
-        with patch.object(post, '_collect', side_effect=TimeoutError('来源连接超时')):
+        with patch.object(post, '_collect', side_effect=TimeoutError('connect timed out')):
             for attempt, delay in enumerate(RETRY_DELAYS, 1):
                 with self.assertRaises(TimeoutError):
                     self.run_task()
@@ -88,6 +88,12 @@ class DownloadPostprocessTests(unittest.TestCase):
         self.assertEqual(task.postprocess_state, 'failed')
         self.assertIsNone(task.next_check_at)
         self.assertIn('自动重试 3 次', task.postprocess_detail)
+        # 说明连同 code 一起落库，读回来照样能按界面语言显示（迁移 0056）。
+        from peach import interface_text
+        payload = task.payload()
+        self.assertEqual(payload['postprocess_detail_code'], 'labels.downloads.postprocessRetriesExhausted')
+        self.assertEqual(interface_text.text(f"server:{payload['postprocess_detail_code']}", payload['postprocess_detail_params'], 'en'),
+                         'Still not finished after 3 automatic retries; TimeoutError: connect timed out')
 
     def test_offline_mount_retries_but_target_collision_stops_immediately(self):
         with patch.object(post.organize, 'build_plan', return_value={
@@ -137,6 +143,43 @@ class DownloadPostprocessTests(unittest.TestCase):
         self.assertEqual(backup.parent, folder)
         self.assertEqual(ledger_backups.list_backups(folder, ledger_backups.ORGANIZE_PATTERN),
                          [*old[3:], backup])
+
+    def test_stuck_cloud_rename_leaves_other_ledger_writes_running(self):
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        # 挂载上的存在判断与改名一起在 `_relocate` 里交给读取子进程，卡在这一步等同网盘改名卡住。
+        original = post.organize._relocate
+
+        def stuck(source, target, worker):
+            entered.set()
+            release.wait(10)
+            return original(source, target, worker)
+
+        outcome = {}
+
+        def organize():
+            try:
+                outcome['result'] = post._organize(self.contract, self.task, self.asset_id)
+            except BaseException as error:
+                outcome['error'] = error
+
+        with patch.object(post.organize, '_relocate', side_effect=stuck):
+            worker = threading.Thread(target=organize)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(10))
+                with self.database.write_transaction(timeout=1) as connection:
+                    connection.execute("UPDATE download_task SET postprocess_detail='other write' WHERE id=?",
+                                       (self.task.id,))
+            finally:
+                release.set()
+                worker.join(10)
+        self.assertNotIn('error', outcome)
+        self.assertEqual(outcome['result']['moved'], 1)
+        self.assertTrue(self.target.exists())
+        with self.database.read_connection() as connection:
+            self.assertEqual(connection.execute('SELECT path FROM asset WHERE id=?', (self.asset_id,)).fetchone()[0],
+                             str(self.target))
 
     def test_retry_uses_the_bound_asset_after_a_move(self):
         post._organize(self.contract, self.task, self.asset_id)
@@ -239,14 +282,32 @@ class DownloadPostprocessTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '来源限流'):
                 self.collect_source(self.contract, self.asset_id, self.handle)
 
+    def test_a_finished_postprocess_drops_its_resume_state_and_a_failed_one_keeps_it(self):
+        config = SimpleNamespace(configured=True, directory=lambda name: self.root)
+        state = post.collect_state_file(config, self.asset_id)
+        state.parent.mkdir(parents=True)
+        for path in (state, state.with_suffix('.issues.jsonl')):
+            path.write_text('{}', encoding='utf-8')
+        (state.parent / f'{self.asset_id}-items').mkdir()
+        with patch.object(post.settings_file, 'active', return_value=config), \
+                patch.object(post, '_collect', side_effect=RuntimeError('simulated stage failure')), \
+                self.assertRaises(RuntimeError):
+            self.run_task()
+        self.assertTrue(state.exists())
+        with patch.object(post.settings_file, 'active', return_value=config), \
+                patch.object(post, '_collect', return_value={}), \
+                patch.object(post, '_organize', return_value={'moved': 0, 'skipped': ''}):
+            self.run_task()
+        self.assertEqual(list(state.parent.iterdir()), [])
+
     def test_metadata_or_organization_failure_never_dispatches_followups(self):
         self.handle.run_id = 123
         self.contract.task_runs = Mock()
         notices = IngestNotices()
         for failed_stage in ('_collect', '_organize'):
-            with self.subTest(stage=failed_stage), patch.object(post, failed_stage, side_effect=RuntimeError('模拟阶段失败')), \
+            with self.subTest(stage=failed_stage), patch.object(post, failed_stage, side_effect=RuntimeError('simulated stage failure')), \
                     patch.object(post, 'NOTICES', notices):
-                with self.assertRaisesRegex(RuntimeError, '模拟阶段失败'):
+                with self.assertRaisesRegex(RuntimeError, 'simulated stage failure'):
                     self.run_task()
                 self.assertEqual(self.store.get(self.task.id).postprocess_state, 'failed')
                 self.contract.task_runs.enqueue_followups.assert_not_called()

@@ -139,6 +139,24 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual((waiting.progress_label, waiting.progress_code),
                          ("等待安装完成后继续", "taskRun.progress.waitingForUpdate"))
 
+    def test_coded_text_is_not_stored_and_is_rendered_when_read(self):
+        # ADR-0159：带 code 的说明与结束原因只存 code 与参数，读出时按资源渲染；没有 code 的原文照存。
+        from peach.task_outcomes import part, said
+        run = self.store.start("entity-avatar", trigger="manual", **item_progress("entity-avatar", "涼森れむ"))
+        self.store.finish(run.id, "succeeded", summary={"name": "涼森れむ", **said(part("installed")),
+                                                         **said(part("sourceCover", code="ABC-001"), field="source")})
+        failed = self.store.start("demo", trigger="manual")
+        self.store.finish(failed.id, "failed", error="RuntimeError: 原文")
+        with closing(sqlite3.connect(self.db)) as connection:
+            rows = dict(connection.execute("SELECT id, coalesce(progress_label,'') || '|' || coalesce(error,'') "
+                                           "FROM task_run").fetchall())
+        self.assertEqual(rows, {run.id: "|", failed.id: "|RuntimeError: 原文"})
+        payload = self.store.get(run.id).payload()
+        self.assertEqual(payload["progress_label"], "资料图片补全：涼森れむ")
+        self.assertEqual((payload["result_summary"]["outcome"], payload["result_summary"]["source"]),
+                         ("已保存资料图片", "作品封面 ABC-001"))
+        self.assertEqual(payload["result_summary"]["outcome_parts"], [{"code": "installed", "params": {}}])
+
     def test_queued_followups_carry_the_code_of_their_label(self):
         from peach.followups import Followup
         parent = self.store.start("library-processing", trigger="manual")
@@ -218,6 +236,37 @@ class TaskRunStoreTests(unittest.TestCase):
                 self.assertLogs("peach.task_runs", "WARNING"), self.database.write_lock:
             self.assertFalse(self.store.progress(run.id, current=3, throttle=0))
         self.assertTrue(self.store.progress(run.id, current=3, throttle=0))
+
+    def test_a_stuck_writer_in_the_same_process_fails_other_writes_instead_of_freezing_them(self):
+        import threading
+        from peach.task_retry import transient_delay
+        from peach.user_messages import UserFacingError
+        run = self.store.start("demo", trigger="manual")
+        holding, release = threading.Event(), threading.Event()
+
+        def stuck():
+            with self.database.write_transaction(notify=False):
+                holding.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=stuck, name="stuck-writer")
+        holder.start()
+        self.addCleanup(holder.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(10))
+        with mock.patch("peach.repository.WRITE_LOCK_SECONDS", 0.05), \
+                self.assertLogs("peach.repository", "WARNING") as logs, \
+                self.assertRaises(sqlite3.OperationalError) as caught:
+            with self.database.write_transaction() as connection:
+                connection.execute("UPDATE task_run SET progress_current=9 WHERE id=?", (run.id,))
+        self.assertIn("stuck-writer", logs.output[0])
+        # 超时发生在拿连接之前，这次写入一行都没有落；错误给人看得懂，重试分类按暂时故障处理。
+        self.assertIsInstance(caught.exception, UserFacingError)
+        self.assertEqual(caught.exception.code, "errors.ledger.writeBusy")
+        self.assertEqual(transient_delay(caught.exception), 0.0)
+        release.set()
+        holder.join(10)
+        self.assertNotEqual(self.store.get(run.id).progress_current, 9)
 
     def test_finish_retries_a_locked_ledger_and_then_lands(self):
         run = self.store.start("demo", trigger="manual", mutex_key="demo")
@@ -398,10 +447,10 @@ class TaskRunStoreTests(unittest.TestCase):
         self.assertEqual(finished.progress_current, 2)
         with self.assertRaises(RuntimeError):
             with self.store.track("demo", trigger="cli") as failing:
-                raise RuntimeError("来源离线")
+                raise RuntimeError("source offline")
         broken = self.store.get(failing.run_id)
         self.assertEqual(broken.status, "failed")
-        self.assertIn("来源离线", broken.error)
+        self.assertIn("source offline", broken.error)
 
     def test_track_hands_back_an_inert_handle_when_the_mutex_is_taken(self):
         self.store.start("demo", trigger="manual", mutex_key="demo")

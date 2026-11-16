@@ -15,6 +15,7 @@ from collections.abc import Callable
 from urllib.parse import urlsplit, urlunsplit
 
 from .catalog_rules import is_jav_code
+from .content_words import LINK_LABEL_BLOG, LINK_LABEL_OFFICIAL, X_GONE_MARKERS
 from .entities import name_chain
 
 #: Facebook 和 Linktree 也在这里：它们此前不在表里，于是走了 official 分支，被贴上
@@ -52,8 +53,6 @@ HOST_ALIASES: dict[str, str] = {
     "mobile.twitter.com": "x.com",
 }
 #: X 登出页在账号封停或不存在时正文里会出现的字样（英文、日文两种界面）。
-X_GONE_MARKERS = ("Account suspended", "アカウントは凍結", "This account doesn’t exist",
-                  "This account doesn't exist", "このアカウントは存在しません")
 META_TAG = re.compile(r"<meta\b[^>]*>", re.I)
 ATTR = re.compile(r'([\w:-]+)\s*=\s*"([^"]*)"')
 
@@ -112,7 +111,12 @@ def canonical_url(url: str) -> str:
 
     只换 netloc 并把 scheme 提到 https，路径、查询和片段原样保留——handle 大小写在 X 上
     不敏感，但它是用户当初复核过的写法，没有理由在这里替他改掉。
+
+    唯一的例外是地址里的 `&amp;`：从页面源码抄地址时连实体一起抄了进来，服务端收到的参数名成了
+    `amp;id`，`id` 因此丢失（`model.php?alias=x&amp;id=176`）。还原成 `&` 才是那一页。
     """
+    while "&amp;" in url:
+        url = url.replace("&amp;", "&")
     parts = urlsplit(url.strip())
     new_host = HOST_ALIASES.get((parts.hostname or "").lower())
     if new_host:
@@ -168,7 +172,7 @@ def classify(url: str, agency: str = "",
 
     `owner_of(hostname)` 给出账本已知的域名归属（厂牌官网、事务所自己的站）。知道归谁
     就用谁的名字；不知道才退回事务所名，那时它至少没有和已知事实矛盾。两样都没有就写
-    「官方网站」——这个词不承诺点过去会见到谁，是唯一诚实的兜底。
+    通用的 `official-site`（界面显示「官方网站」）——它不承诺点过去会见到谁，是唯一诚实的兜底。
     """
     name = platform(url)
     if name:
@@ -179,10 +183,10 @@ def classify(url: str, agency: str = "",
         return "social", (f"{name} @{shown}" if shown else name)
     host = host_of(url)
     if under(host, BLOG_HOSTS):
-        return "social", "博客"
+        return "social", LINK_LABEL_BLOG
     # `owner_of` 常常就是某个 dict 的 `.get`，未命中给的是 None 不是空串。
     owner = str(owner_of(host) or "" if owner_of else "").strip()
-    return "official", (owner or agency.strip() or "官方网站")
+    return "official", (owner or agency.strip() or LINK_LABEL_OFFICIAL)
 
 
 #: 一个域名要被多少条链接指认成同一家，才算「账本知道它归谁」。
@@ -222,7 +226,7 @@ def host_owners(connection: sqlite3.Connection) -> dict[str, str]:
         votes.setdefault(host, {})[label] = votes.setdefault(host, {}).get(label, 0) + 1
     for host, tally in votes.items():
         label, count = max(tally.items(), key=lambda item: item[1])
-        if count >= OWNER_QUORUM and label != "官方网站":
+        if count >= OWNER_QUORUM and label != LINK_LABEL_OFFICIAL:
             owners[host] = label
     # 厂牌那一手证据后写，压过女优链接里的共识。事务所的官网链接不算在内：
     # 那批链接是 `install_agencies.py` 反过来照这个函数的结论装的，再收回来当

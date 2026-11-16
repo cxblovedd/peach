@@ -9,6 +9,7 @@
  *
  * 首屏由壳铺骨架，身份资料就绪后挂载页面；作品、照片与新作各自替换对应区域的骨架。 */
 import { api } from '@peach/legacy/core';
+import { appSettingsStore } from '@peach/appearance';
 
 import type { CatalogGridProps, MediaPage } from '../catalog-grid/types';
 import type { EntityBodyActions, EntityBodyHelpers, EntityCodeSet, EntityLocalPhoto, PhotoLayout, PhotoSize } from '../entity-body/entity-body';
@@ -45,11 +46,44 @@ export interface EntityPageData extends EntityHeroData {
   mark_link_id?: number | null;
 }
 
+/** 合并的双方：名字与直接作品数。`/api/entity-merge` 直接读，添加别名撞名时也随结果回来。 */
+export interface EntityMergePair {
+  kind: string;
+  alias: string;
+  current: { id: number; canonical_name: string; works: number };
+  other: { id: number; canonical_name: string; works: number };
+}
+
+/** 添加别名撞上另一份同类档案。撞的是对方的名字时别名没写；`shared` 是撞上对方的别名，
+ *  别名照常写了（同名的不一定是同一份），页面再问要不要合并。 */
+export interface EntityAliasConflict extends EntityMergePair {
+  shared?: boolean;
+}
+
+/** 保留作品多的一侧；作品数相同保留当前页，一次点击不先替用户决定旧 ID 指向哪边。 */
+export function mergeSides(pair: EntityMergePair) {
+  const keepCurrent = pair.current.works >= pair.other.works;
+  return keepCurrent ? { keep: pair.current, absorb: pair.other } : { keep: pair.other, absorb: pair.current };
+}
+
+export interface EntityAliasWriteResult {
+  added?: boolean;
+  alias?: string;
+  conflict?: EntityAliasConflict;
+}
+
+export interface EntityMergeResult {
+  target: { id: number; canonical_name: string };
+  source: { id: number; canonical_name: string };
+}
+
 /** `/api/photos`、`/api/photo-set` 的一页。`sets` 里 `kind` 为 `code` 的是名下作品的官方样张。 */
 export interface PhotoPage {
   error?: string;
   id?: number | string;
+  /** 图集标题是目录名；取不到目录名时是固定说法，旁边带 `title_code`。 */
   title?: string;
+  title_code?: string;
   total?: number;
   sample_total?: number;
   sets?: (EntityCodeSet & { kind?: string })[];
@@ -105,7 +139,8 @@ export interface EntityPageHelpers {
   /** 失败回执（`actionFailure`）。 */
   failure(label: string, error: unknown): void;
   /** 「添加别名」弹层：表单与回执在壳里，写回交给 `write`（页面的 mutation，成功后重取资料与作品）。 */
-  aliasForm(mine: string[], write: (payload: { alias: string; remove?: boolean }) => Promise<{ added?: boolean; alias?: string }>): Promise<void>;
+  aliasForm(mine: string[], write: (payload: { alias: string; remove?: boolean }) => Promise<EntityAliasWriteResult>):
+    Promise<EntityAliasWriteResult | undefined>;
   /** 图集那两枚源文件键；`done` 在对账改动了这一组之后重取它。 */
   sourceToolsHtml(setId: number): string;
   wireSourceTools(root: Element, done: () => void): void;
@@ -155,9 +190,11 @@ export interface EntityPageProps extends SharedGridProps {
   hosts: EntityPageHosts;
   /** 卡片上的助手与动作就是目录那一份；照片墙多一枚定位源文件。 */
   card: { helpers: EntityBodyHelpers; actions: Omit<EntityBodyActions, 'loadMorePhotos'> };
-  /** 在线视图里的关注卡：骨架、拖动与进度同关注页那一份；动作是资料页语境的一份，换筛选、侧栏、
-   *  多选与图片偏好都不接（这一页不画关注页的侧栏，多选认的是本地作品）。 */
+  /** 在线视图里的关注卡：骨架、拖动与进度同关注页那一份；动作是资料页语境的一份，换筛选、侧栏与
+   *  图片偏好都不接（这一页不画关注页的侧栏）。多选认关注条目，选择集是 `followSelected`。 */
   follow: { helpers: FollowFeedHelpers; actions: FollowFeedActions };
+  /** 在线视图里选中的关注条目，和作品区的 `selected` 分开。 */
+  followSelected?: ReadonlySet<number>;
   helpers: EntityPageHelpers;
   actions: EntityPageActions;
 }
@@ -279,5 +316,7 @@ export async function prefetchEntityPage(props: EntityPageProps): Promise<void> 
   const entity = await queryClient.fetchQuery(entityOptions(kind, name));
   if (!entity || entity.error || !entity.id) return;
   if (!props.restoreNavigation) queryClient.removeQueries({ queryKey: feedNewKey(Number(entity.id)) });
+  /* 设置关掉了新作行就不预取。 */
+  if (appSettingsStore().value.feedNewRows === false) return;
   void queryClient.prefetchQuery(feedNewOptions(Number(entity.id), props.helpers.feedRowHtml));
 }

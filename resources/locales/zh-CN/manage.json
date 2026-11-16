@@ -100,6 +100,7 @@
   "completionPrompt": {
     "afterCurrentTask": "当前任务结束后可单独补全。",
     "allMetered": "这批影片中有 {{count, number}} 部暂无预览，都在流量保护目录，同步时不抽帧，{{tail}}",
+    "dismiss": "不再提示",
     "done": "补全完成：取得 {{count, number}} 张封面，生成 {{previews}} 部视频预览。",
     "failed": "补全未完成",
     "fillMetered": "补全流量保护的 {{count, number}} 部",
@@ -130,7 +131,6 @@
     "loadingStatus": "正在读取连接检查状态",
     "messageSuffix": "。{{message}}",
     "notFinished": "检查未完成",
-    "progress": "连接检查进度",
     "reachableCount": "可连接的 {{count, number}} 项",
     "reachableTarget": "{{target}}：可连接",
     "seconds": "{{seconds}} 秒",
@@ -238,6 +238,7 @@
   },
   "downloadsPanel": {
     "cancelDownload": "取消",
+    "channelAlert": "{{detail}}。浏览器添加已暂停，恢复后自动继续",
     "codeUnrecognized": "番号未识别",
     "collapseTitle": "收起标题",
     "copyFailed": "复制失败，请检查剪贴板权限",
@@ -276,12 +277,17 @@
     "title": "高清封面"
   },
   "hdUpgrades": {
+    "clearSelection": "取消选择",
+    "dockLabel": "所选高清升级的操作",
     "emptyBody": "现有版本都已满足条件，或还没有加入追踪。",
     "emptyTitle": "没有标记中的高清版目标",
     "loadFailed": "高清版目标读取失败",
     "noPreview": "暂无预览",
     "notFound": "未取得高清版目标，请刷新页面重试。",
     "openVideo": "打开 {{title}}",
+    "selectAll": "全选",
+    "selectVideo": "选择 {{title}}",
+    "selectedCount": "已选 {{count, number}} 部",
     "showingFirst": "显示前 {{shown}} 部，共 {{count, number}} 部。",
     "summaryLabel": "待升级",
     "unknownSize": "大小未知",
@@ -324,11 +330,8 @@
     "checkFailed": "检查失败",
     "historySources": "抓取历史：已完成 {{checked}}/{{count, number}} 个来源",
     "preparing": "正在准备检查任务",
-    "processed": "已处理 {{done}} / {{total}}",
-    "progressLabel": "任务进度",
     "reconnecting": "暂时无法读取进度，正在重新连接…",
     "stateExpired": "任务状态已失效，请重新发起任务",
-    "status": "任务状态",
     "titledProgress": "{{title}}：已完成 {{checked}}/{{total}}",
     "updateSources": "检查更新：已完成 {{checked}}/{{count, number}} 个来源"
   },
@@ -541,7 +544,13 @@
     "selectGroup": "全选本组",
     "sourceChosen": "已选择 {{source}}，点击通过所选采用。",
     "switchCategoryHint": "可切换分类查看其他待确认资料。",
-    "viewOtherCategories": "查看其他分类"
+    "viewOtherCategories": "查看其他分类",
+    "confirm": {
+      "approved": "将通过选中的 {{count, number}} 项，按所选来源写入资料。",
+      "rejected": "将忽略选中的 {{count, number}} 项，移到「已忽略」。",
+      "restore": "将选中的 {{count, number}} 项放回待处理。",
+      "skipped": "将选中的 {{count, number}} 项移到稍后处理。"
+    }
   },
   "reviewQueue": {
     "approved": "已通过",
@@ -940,7 +949,6 @@
     "taskDetailsCount": "任务明细 · {{count, number}} 项",
     "taskErrorDetails": "{{task}}错误详情",
     "taskList": "任务列表",
-    "taskProgress": "{{task}}进度",
     "taskTechnicalDetails": "{{task}}技术详情",
     "technicalDetails": "技术详情",
     "took": "用时 {{elapsed}}"
@@ -979,26 +987,11 @@
     "watchLater": "加入稍后看"
   },
   "taskOutcome": {
-    "alreadyCreator": "已有创作者分类",
-    "changedElsewhere": "资料已被其他操作修改，本次未保存",
     "complete": "处理完成",
     "faceModelUnavailable": "人脸模型不可用，未做人脸核对",
     "followupsScheduled": "已安排 {{count, number}} 项补充任务",
-    "imageSaved": "已保存资料图片",
-    "imageTooSmall": "图片分辨率不足",
     "interrupted": "处理已中断",
-    "linkedSite": "已关联 {{site}} 资料页",
-    "noMatch": "未找到与该人物相符的资料页",
-    "noMatchThree": "三个来源均未找到与该人物相符的资料页",
-    "noMatchTwo": "两个来源均未找到与该人物相符的资料页",
-    "noNewAliases": "未发现新别名",
-    "noOfficialSite": "未取得厂牌官网信息",
-    "noVideoLists": "两个来源均未提供作品列表",
-    "partial": "处理已结束，部分项目需处理",
-    "profileGone": "资料记录已不存在",
-    "savedFromSite": "已保存来自 {{site}} 的资料",
-    "smallImageKept": "已保留身份核对通过的小尺寸图片",
-    "stillCurrent": "现有资料仍在有效期内"
+    "partial": "处理已结束，部分项目需处理"
   },
   "taskResources": {
     "highUsage": "当前为高占用。",

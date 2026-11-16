@@ -22,6 +22,7 @@ from peach import feed_followup, feeds, web_entity, web_feeds, web_settings, web
 from peach import web_jav_browser_performer as performer  # noqa: E402
 from peach.http import HttpResponse  # noqa: E402
 from peach.web_contract import WebContract  # noqa: E402
+from peach.task_outcomes import part  # noqa: E402
 from peach.web_router import dispatch_api_get, dispatch_api_post  # noqa: E402
 from support.ledger import fresh_ledger  # noqa: E402
 
@@ -135,6 +136,7 @@ class FeedWebFixture(unittest.TestCase):
         self.contract.avatar_root = self.contract.candidate_root / "avatars"
         self.cover_misses: set[str] = set()
         self.cover_unreachable: set[str] = set()
+        self.cover_broken: set[str] = set()
         self.cover_urls: dict[str, str | None] = {}
         self._fetch_cover = feed_followup.fetch_cover
         feed_followup.fetch_cover = self._fake_cover
@@ -150,10 +152,13 @@ class FeedWebFixture(unittest.TestCase):
     def _fake_cover(self, contract, code, cover_url=None):
         self.cover_urls[code] = cover_url
         if code in self.cover_misses:
-            raise RuntimeError("官方渠道没有这个番号的封面")
+            from peach.jav_cover_fetch import NO_CANDIDATES_CODE, NotFound
+            raise NotFound(NO_CANDIDATES_CODE)
+        if code in self.cover_broken:
+            raise RuntimeError("cover pipeline crashed")
         if code in self.cover_unreachable:
-            from peach.jav_cover_fetch import HOSTS_UNREACHABLE, CoverConnectError
-            raise CoverConnectError(HOSTS_UNREACHABLE)
+            from peach.jav_cover_fetch import HOSTS_UNREACHABLE_CODE, CoverConnectError
+            raise CoverConnectError(HOSTS_UNREACHABLE_CODE)
         from PIL import Image
         image = Image.new("RGB", (800, 538), (40, 40, 40))
         image.paste((200, 120, 150), (420, 0, 800, 538))
@@ -226,6 +231,27 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual(errors, [])
         self.assertFalse(self.contract.feed_job.thread.is_alive())
 
+    def test_a_round_that_stays_paused_does_not_hold_the_caller(self):
+        """这一轮在任务中心被暂停、一直不恢复：同步发起的一方（定时那一跳也是）到期就回来。"""
+        self._add()
+        entered, release = threading.Event(), threading.Event()
+        def paused(contract, body, job_id):
+            entered.set()
+            release.wait(10)
+            return {"ok": True, "checked": 0, "total": 0, "results": [], "added": 0, "stock": False}
+        with patch.object(web_feeds, "_execute_check", side_effect=paused), \
+                patch.object(web_feeds, "CHECK_WAIT_SECONDS", 0.3):
+            try:
+                begun = time.monotonic()
+                result = dispatch_api_post(self.contract, "/api/feeds/check", {"all": True})
+                self.assertLess(time.monotonic() - begun, 5, "同步发起的一方一直等到这一轮跑完")
+                self.assertTrue(entered.is_set())
+                self.assertEqual(result["status"], "running")
+            finally:
+                release.set()
+                self.contract.feed_job.thread.join(5)
+        self.assertEqual(dispatch_api_get(self.contract, "/api/feeds/check", {})["status"], "complete")
+
     def test_schedule_route_reports_feed_scheduler_failures(self):
         from peach.follow_scheduler import FEED_JOB_ID, FollowScheduleConfig, FollowUpdateScheduler
         idle = dispatch_api_get(self.contract, "/api/feeds/schedule", {})
@@ -244,6 +270,21 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual((status["available"], status["enabled"], status["interval_minutes"]),
                          (True, True, feeds.DEFAULT_INTERVAL_MINUTES))
         self.assertEqual((status["last_error"], status["consecutive_failures"]), ("1 个来源检查失败", 2))
+
+    def test_schedule_route_saves_switch_and_interval(self):
+        from peach.follow_scheduler import FEED_JOB_ID, FollowScheduleConfig, FollowUpdateScheduler
+        root = Path(self.temporary.name) / "schedule"
+        self.contract.feed_scheduler = FollowUpdateScheduler(
+            root, lambda: {"ok": True}, available=True, job_id=FEED_JOB_ID, filename="feed-schedule.json",
+            default=FollowScheduleConfig(enabled=True, interval_minutes=feeds.DEFAULT_INTERVAL_MINUTES))
+        saved = dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": True, "interval_minutes": 720})
+        self.assertEqual((saved["enabled"], saved["interval_minutes"]), (True, 720))
+        off = dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": False, "interval_minutes": 720})
+        self.assertFalse(off["enabled"])
+        self.assertEqual(json.loads((root / "feed-schedule.json").read_text(encoding="utf-8")),
+                         {"enabled": False, "interval_minutes": 720})
+        with self.assertRaises(ValueError):
+            dispatch_api_post(self.contract, "/api/feeds/schedule", {"enabled": True, "interval_minutes": 5})
 
     def test_recovery_keeps_source_selection_progress_and_discovered_codes(self):
         from peach import job_recovery
@@ -473,7 +514,7 @@ class FeedWebTest(FeedWebFixture):
                                " VALUES('NOAH-101',1,'',NULL,'2026-09-22',?)", (feeds.stamp(),))
             connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
                                " VALUES('ABP-123',1,'',NULL,'2026-09-22',?)", (feeds.stamp(),))
-        expected = {"HMN-071": ("missing", "上次没取到：封面处理未完成"),
+        expected = {"HMN-071": ("missing", "上次没取到：所有渠道都没有候选"),
                     "NOAH-101": ("missing", "韩国 MIB 不适用 JAV 封面来源"),
                     "ABP-123": ("queued", "等下一轮订阅检查分批取图")}
         with patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=None):
@@ -484,7 +525,7 @@ class FeedWebTest(FeedWebFixture):
 
     def test_unreleased_works_wait_off_the_list_while_the_official_cover_is_a_placeholder(self):
         """未发售、官方只回「准备中」占位图的先不列，后台照旧重取；已发售的旧作与没取过图的照常列出。"""
-        from peach.jav_cover_fetch import NotFound, OFFICIAL_PLACEHOLDER_ONLY
+        from peach.jav_cover_fetch import NotFound, OFFICIAL_PLACEHOLDER_ONLY_CODE
         future = (datetime.now() + timedelta(days=30)).date().isoformat()
         rows = {"VRKM-971": future, "HIGM-183": "2024-03-09", "VRKM-972": future}
         with self.contract.database.write_transaction() as connection:
@@ -492,7 +533,7 @@ class FeedWebTest(FeedWebFixture):
                 connection.execute("INSERT INTO feed_discovery(code,source_id,title,link,release_date,discovered_at)"
                                    " VALUES(?,NULL,'',NULL,?,?)", (code, released, feeds.stamp()))
         for code in ("VRKM-971", "HIGM-183"):
-            feed_followup.record_cover_attempt(self.contract, code, ok=False, error=NotFound(OFFICIAL_PLACEHOLDER_ONLY))
+            feed_followup.record_cover_attempt(self.contract, code, ok=False, error=NotFound(OFFICIAL_PLACEHOLDER_ONLY_CODE))
         with patch("peach.jav_discovery_metadata.DiscoveryMetadata.ensure", return_value=None):
             for path in ("/api/feeds/discoveries", "/api/jav/releases"):
                 codes = {item["code"] for item in dispatch_api_get(self.contract, path, {})["items"]}
@@ -507,6 +548,10 @@ class FeedWebTest(FeedWebFixture):
         row = dispatch_api_get(self.contract, "/api/feeds", {})["sources"][0]
         self.assertEqual(row["last_error"], "来源回了 HTTP 503")
         self.assertIsNotNone(row["next_fetch_at"])
+        # 原因连同 code 落在源那一行上，英文界面照 code 显示（迁移 0056）。
+        from peach import interface_text
+        self.assertEqual(interface_text.text(f"server:{row['last_error_code']}", row["last_error_params"], "en"),
+                         "The source returned HTTP 503.")
 
     def _sources_named(self, *names):
         """再加几个演员页源，各回一份同样的样本页。返回全部源 id，第一个是 `_add` 那个。"""
@@ -531,7 +576,7 @@ class FeedWebTest(FeedWebFixture):
         def refused(request, timeout, max_bytes):
             served.requests.append(request)
             scraping_access.pause_source(self.contract.follow_secrets_root, "javdb", refused=True)
-            raise scraping_access.SourcePaused("来源拒绝访问，暂停向它请求一段时间")
+            raise scraping_access.SourcePaused("errors.scrapingAccess.refused")
 
         self.transport = refused
         result = self._check()
@@ -901,7 +946,11 @@ class FeedWebTest(FeedWebFixture):
         self.cover_misses.add("HMN-071")
         missed = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "hmn-071"})
         self.assertEqual((missed["code"], missed["has_cover"], missed["message"]),
-                         ("HMN-071", False, "封面处理未完成"))
+                         ("HMN-071", False, "所有渠道都没有候选"))
+        # 取图链以外的故障不把原文给用户看，只说没处理完。
+        self.cover_broken.add("IPX-001")
+        broken = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "IPX-001"})
+        self.assertEqual((broken["has_cover"], broken["message"]), (False, "封面处理未完成"))
         got = dispatch_api_post(self.contract, "/api/jav/cover", {"code": "SSIS-950"})
         self.assertEqual((got["has_cover"], got["message"]), (True, ""))
         self.assertTrue(got["cover_version"])
@@ -913,10 +962,10 @@ class FeedWebTest(FeedWebFixture):
         self._check()
         with self.contract.database.write_transaction() as connection:
             connection.execute("UPDATE feed_discovery SET link='https://javdb.com/v/Source01' WHERE code='SSIS-950'")
-        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('官方封面未取得')), \
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('errors.javCoverFetch.catalogUnfinished')), \
                 patch('peach.javdb_public.PUBLIC_API.image') as source_image, \
                 patch('peach.javdb_public.PUBLIC_API.remember_movie_identity') as identity:
-            with self.assertRaisesRegex(Unavailable, '官方封面未取得'):
+            with self.assertRaisesRegex(Unavailable, '官方目录查询未完成'):
                 self._fetch_cover(self.contract, 'SSIS-950')
         identity.assert_not_called()
         source_image.assert_not_called()
@@ -928,7 +977,7 @@ class FeedWebTest(FeedWebFixture):
         evidence = self.contract.cover_root / 'DEAS-082.scraping.json'
         evidence.parent.mkdir(parents=True, exist_ok=True)
         evidence.write_text(json.dumps({'code': 'DEAS-082', 'source_url': recorded}), encoding='utf-8')
-        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('官方封面未取得')) as best:
+        with patch('peach.jav_cover_fetch.best_cover', side_effect=Unavailable('errors.javCoverFetch.catalogUnfinished')) as best:
             for cover_url in (None, given):
                 with self.assertRaises(Unavailable):
                     self._fetch_cover(self.contract, 'DEAS-082', cover_url)
@@ -993,6 +1042,99 @@ class FeedWebTest(FeedWebFixture):
         self.assertEqual(batch[-feed_followup.RETRY_SHARE:],
                          [f"OLD-{number:03d}" for number in range(feed_followup.RETRY_SHARE)])
 
+    BLURAY_TITLE = "Pretty Glamour ― 誰もが恋する私に ― /藤森里穂（ブルーレイディスク）"
+
+    def _bluray_shell(self, code="GRABD-039", title=BLURAY_TITLE):
+        with self.contract.database.write_transaction() as connection:
+            entity = connection.execute(
+                "INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at)"
+                " VALUES('performer','藤森里穂',peach_normalize('藤森里穂'),?,?)",
+                (feeds.stamp(), feeds.stamp())).lastrowid
+            shell = feeds.create_shell(connection, code, source_id=None, title=title,
+                                       performers="藤森里穂", entity_id=entity)
+            connection.execute("UPDATE feed_discovery SET scraped_at='2026-01-01T00:00:00Z',"
+                               "cover_url='https://c0.jdbstatic.com/covers/qn/QNZQX9.jpg' WHERE id=?", (shell,))
+        return shell
+
+    def _run_scrape(self, *codes):
+        handle = SimpleNamespace(saved={}, progress=lambda **_: None, checkpoint=lambda **_: None)
+        return feed_followup.run(self.contract, feed_followup.followup_key(codes), handle)
+
+    def test_a_bluray_product_number_resolves_to_its_dmm_streaming_edition_by_title(self):
+        """蓝光版品番 DMM 配信版里没有，序号也可能不同；标题去掉版本字样、出演者对得上的才算同一部。"""
+        def answer(request):
+            payload = json.loads(request.body)
+            if "legacySearchPPV" in payload["query"]:
+                self.assertEqual(payload["variables"]["queryWord"], "Pretty Glamour 誰もが恋する私に 藤森里穂")
+                contents = [{"id": "h_1714grace00039"}, {"id": "h_1714grace00038"}]
+                return HttpResponse(200, {"Content-Type": "application/json"},
+                                    json.dumps({"data": {"legacySearchPPV": {"result": {"contents": contents}}}}).encode(),
+                                    DMM_ENDPOINT)
+            cid = payload["variables"]["id"]
+            item = {"h_1714grace00039": ("GRACE-039", "Pretty Glamour ー 誰もが恋する私に ー 藤森里穂"),
+                    "h_1714grace00038": ("GRACE-038", "Pretty Glamour ー 別の作品 ー 藤森里穂")}[cid]
+            content = {"id": cid, "makerContentId": item[0], "title": item[1], "actresses": [{"name": "藤森里穂"}]}
+            return HttpResponse(200, {"Content-Type": "application/json"},
+                                json.dumps({"data": {"ppvContent": content}}).encode(), DMM_ENDPOINT)
+
+        from peach.jav_editions import digital_edition
+        root = self.contract.follow_secrets_root
+        transport = FakeTransport({DMM_ENDPOINT: answer})
+        self.assertEqual(digital_edition(self.BLURAY_TITLE, ["藤森里穂"], root, transport=transport), "GRACE-039")
+        self.assertEqual(digital_edition(self.BLURAY_TITLE, ["別の人"], root, transport=transport), "",
+                         "出演者对不上的不算同一部")
+        asked = len(transport.requests)
+        self.assertEqual(digital_edition("Pretty Glamour 藤森里穂", ["藤森里穂"], root, transport=transport), "")
+        self.assertEqual(len(transport.requests), asked, "标题没写蓝光的不问 DMM")
+
+    def test_a_bluray_shell_whose_streaming_edition_is_listed_leaves_the_list(self):
+        self._bluray_shell()
+        with self.contract.database.write_transaction() as connection:
+            feeds.create_shell(connection, "GRACE-039", source_id=None,
+                               title="Pretty Glamour ー 誰もが恋する私に ー 藤森里穂")
+        with patch("peach.jav_editions.digital_edition", return_value="GRACE-039") as lookup:
+            self._run_scrape("GRABD-039")
+        lookup.assert_called_once()
+        self.assertEqual(lookup.call_args.args[:2], (self.BLURAY_TITLE, ["藤森里穂"]))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT code FROM feed_discovery")], ["GRACE-039"])
+            self.assertIsNone(connection.execute("SELECT 1 FROM feed_discovery_entity WHERE discovery_id NOT IN"
+                                                 " (SELECT id FROM feed_discovery)").fetchone())
+        self.assertNotIn("GRABD-039", self.cover_urls)
+
+    def test_a_listed_bluray_shell_without_a_cover_becomes_its_streaming_edition(self):
+        """存量里取过资料、封面一直取不到的蓝光版归取资料那一批：改成配信版番号，资料与封面按它重取。"""
+        shell = self._bluray_shell("REBDB-1006", "Hinako2 Eternal Wave・森日向子 ブルーレイエディション（ブルーレイディスク）")
+        with self.contract.database.read_connection() as connection:
+            batch = feed_followup.scrape_batch(connection, hidden=frozenset(), retry_after=timedelta(0),
+                                               cover_root=self.contract.cover_root)
+        self.assertEqual(batch, ["REBDB-1006"])
+        self.assertEqual(self._cover_backlog(), [], "补封面那条通道不写账本，蓝光版不排进去")
+        with patch("peach.jav_editions.digital_edition", return_value="REBD-1021"):
+            summary = self._run_scrape(*batch)
+        self.assertEqual(summary["covers"], 1)
+        with self.contract.database.read_connection() as connection:
+            row = connection.execute("SELECT id,code,title,cover_url FROM feed_discovery").fetchone()
+            linked = connection.execute("SELECT entity_id FROM feed_discovery_entity WHERE discovery_id=?",
+                                        (shell,)).fetchall()
+        self.assertEqual((row["id"], row["code"], row["title"]), (shell, "REBD-1021", "REBD-1021 的标题"))
+        self.assertEqual(self.cover_urls, {"REBD-1021": "https://images.example.test/cover.jpg"})
+        self.assertEqual(len(linked), 1, "出演者关联跟着壳走")
+        # 并完就不再是蓝光版，下一轮不再问 DMM。
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feed_followup.scrape_batch(connection, hidden=frozenset(), retry_after=timedelta(0),
+                                                        cover_root=self.contract.cover_root), [])
+
+    def test_a_bluray_shell_stays_when_dmm_has_no_matching_edition(self):
+        self._bluray_shell()
+        with patch("peach.jav_editions.digital_edition", side_effect=OSError("timeout")):
+            self._run_scrape("GRABD-039")
+        with patch("peach.jav_editions.digital_edition", return_value=""):
+            self._run_scrape("GRABD-039")
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT code FROM feed_discovery")], ["GRABD-039"])
+        self.assertIn("GRABD-039", self.cover_urls, "对不上时照旧按原番号取封面")
+
     def test_scraping_one_code_stops_at_the_metadata_budget(self):
         """来源连不上时一部最多问到资料预算为止，原因写成哪几家在多少秒内没答复。"""
         from peach.jav_cover_fetch import DeadlineExceeded
@@ -1003,7 +1145,7 @@ class FeedWebTest(FeedWebFixture):
         class Silent:
             def community(self, code, *, deadline=None, route=None):
                 seen["remaining"] = float(deadline) - time.monotonic()
-                raise DeadlineExceeded("动作预算已用尽")
+                raise DeadlineExceeded("errors.javCoverFetch.deadline")
 
         with self.assertRaisesRegex(DeadlineExceeded, "秒内没有答复"):
             self._collect(Silent(), "SSIS-950")
@@ -1165,7 +1307,7 @@ class FeedWebTest(FeedWebFixture):
         self.assertIn(key, [item["key"] for item in self._check(automatic=True)["followups"]])
         with self.contract.database.read_connection() as connection:
             current = avatar_followup.fingerprint(connection, entity_id, providers_root)
-        Attempts(attempts_root(self.contract.candidate_root)).record(key, current, "图库 6 张认不准")
+        Attempts(attempts_root(self.contract.candidate_root)).record(key, current, [part("galleryUnsure", count=6)])
         self._stock_window_passes()
         self.assertNotIn(key, [item["key"] for item in self._check(automatic=True)["followups"]])
         index_path.write_text(json.dumps({"Content": {"1-S1": {"二の宮すずか.jpg": "二の宮すずか.jpg"}}}), encoding="utf-8")
@@ -1401,6 +1543,33 @@ class PerformerFeedSwitchTest(PerformerFeedFixture):
         # 两类源一起开、一起关。
         self._switch(False)
         self.assertEqual([source["enabled"] for source in self._sources()], [False, False])
+
+    def test_her_censored_javdb_page_is_skipped_while_her_dmm_catalogue_answers(self):
+        """DMM 片单拉成功后，定时轮次绕过她在 JavDB 上的有碼页；無碼页照拉，DMM 出错时 JavDB 接上。源都不停用。"""
+        self._dmm_id(self.performer)
+        self.transport.responses[DMM_ENDPOINT] = dmm_catalogue([], {})
+        self._switch(True)
+        self._settled()
+        sources = {source["kind"]: source for source in self._sources()}
+        javdb, dmm = sources[feeds.KIND_JAVDB_ACTOR], sources[feeds.KIND_DMM_ACTRESS]
+        future = "2999-01-01T00:00:00Z"
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), {javdb["id"]})
+            self.assertEqual([row["id"] for row in feeds.due_sources(connection, future)], [dmm["id"]])
+        self.assertTrue(all(source["enabled"] for source in self._sources()), "绕过不等于停用")
+        # 她这一页是無碼记录时照拉。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE entity_external_ref SET metadata_json=? WHERE entity_id=? AND provider='javdb'",
+                               (json.dumps({"uncensored": True}), self.performer))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), set())
+        # DMM 片单上次失败时 JavDB 接上。
+        with self.contract.database.write_transaction() as connection:
+            connection.execute("UPDATE entity_external_ref SET metadata_json='{}' WHERE entity_id=? AND provider='javdb'",
+                               (self.performer,))
+            connection.execute("UPDATE feed_source SET last_error='HTTP 503' WHERE id=?", (dmm["id"],))
+        with self.contract.database.read_connection() as connection:
+            self.assertEqual(feeds.covered_by_dmm(connection), set())
 
     def test_a_dmm_failure_lands_on_its_own_row(self):
         self._dmm_id(self.performer)

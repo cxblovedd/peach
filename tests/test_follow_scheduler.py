@@ -62,7 +62,7 @@ class FollowUpdateSchedulerTests(unittest.TestCase):
     def test_installation_reservation_skips_the_tick_without_recording_a_failure(self):
         from peach.update_tasks import UpdateBusy
         def blocked():
-            raise UpdateBusy('正在安装')
+            raise UpdateBusy('errors.updateTasks.installInProgress')
         with tempfile.TemporaryDirectory() as temporary:
             scheduler = FollowUpdateScheduler(Path(temporary), blocked, available=True)
             with self.assertNoLogs('peach', level='ERROR'):
@@ -121,7 +121,7 @@ class FollowUpdateSchedulerTests(unittest.TestCase):
     def test_consecutive_failures_back_off_and_a_good_run_resets_them(self):
         outcomes = [
             {"ok": True, "checked": 1, "results": [{"ok": False, "added": 0}]},
-            RuntimeError("上游断了"),
+            RuntimeError("upstream closed the connection"),
             {"ok": True, "checked": 1, "results": [{"ok": True, "added": 2}]},
         ]
 
@@ -148,10 +148,10 @@ class FollowUpdateSchedulerTests(unittest.TestCase):
             self.assertEqual(first["failing_since"], first["last_started_at"])
             with self.assertLogs("peach.follow_scheduler", level="ERROR") as captured:
                 scheduler._run()
-            self.assertIn("上游断了", "\n".join(captured.output))
+            self.assertIn("upstream closed the connection", "\n".join(captured.output))
             status = scheduler.status()
             self.assertEqual(status["consecutive_failures"], 2)
-            self.assertEqual(status["last_error"], "上游断了")
+            self.assertEqual(status["last_error"], "upstream closed the connection")
             # 连续失败的起点停在第一轮，不跟着每一轮往后挪。
             self.assertEqual(status["failing_since"], first["failing_since"])
             scheduler._run()
@@ -254,6 +254,21 @@ class FollowUpdateSchedulerTests(unittest.TestCase):
             self.assertEqual(status["consecutive_failures"], 1)
             self.assertEqual((status["last_started_at"], status["last_finished_at"], status["last_checked"]),
                              (failed["last_started_at"], failed["last_finished_at"], 1))
+            self.assertFalse(status["running"])
+
+    def test_a_round_still_running_at_the_wait_limit_is_neither_success_nor_failure(self):
+        """等满期限这一轮还没跑完（多半被暂停了）：调度线程先回来，不按成功结算掉上一轮的失败，也不退避。"""
+        outcomes = [{"ok": True, "checked": 1, "results": [{"ok": False, "added": 0}]},
+                    {"ok": True, "status": "running", "checked": 0, "results": []}]
+        with tempfile.TemporaryDirectory() as temporary:
+            scheduler = FollowUpdateScheduler(Path(temporary), lambda: outcomes.pop(0), available=True)
+            scheduler._run()
+            failed = scheduler.status()
+            scheduler._run()
+            status = scheduler.status()
+            self.assertEqual((status["last_error"], status["consecutive_failures"]), ("1 个来源检查失败", 1))
+            self.assertEqual((status["last_finished_at"], status["last_checked"]), (failed["last_finished_at"], 1))
+            self.assertIsNotNone(status["last_started_at"])
             self.assertFalse(status["running"])
 
     def test_reader_never_starts_or_accepts_schedule_changes(self):

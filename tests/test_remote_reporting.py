@@ -482,15 +482,66 @@ class RemoteReportingTests(unittest.TestCase):
         client = mock.Mock()
         with mock.patch.object(reporting, '_new_client', return_value=client), \
                 mock.patch.object(reporting.threading, 'Timer') as timer, \
+                mock.patch.object(reporting, 'datetime', wraps=datetime) as wall, \
                 mock.patch.object(frequency, '_now', return_value=now) as clock:
+            wall.now.return_value = now
             reporting.save({"usage": True, "errors": True})
             for _ in range(4):
                 reporting.capture('unhandled-main', ValueError('private'))
             callback = timer.call_args.args[1]
-            clock.return_value = now + timedelta(seconds=frequency.INTERVAL)
+            clock.return_value = wall.now.return_value = now + timedelta(seconds=frequency.INTERVAL)
             callback()
             self.assertEqual(client.capture_event.call_count, 1)
             self.assertEqual([count['occurrence_count'] for count in self._counts(client)], [4])
+
+    def test_frequency_timer_sleeps_until_the_next_day_or_count_interval(self):
+        """不再每分钟取锁读写状态文件：排到日界或计数到期点，新计数防抖后落盘。"""
+        from peach import diagnostic_frequency as frequency
+        timers = []
+
+        class FakeTimer:
+            def __init__(self, delay, callback):
+                self.delay, self.callback, self.cancelled, self.daemon = delay, callback, False, False
+                timers.append(self)
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                self.cancelled = True
+
+        def fire(at):
+            wall.now.return_value = clock.return_value = at
+            active = [timer for timer in timers if not timer.cancelled]
+            self.assertEqual(len(active), 1)
+            active[0].cancelled = True
+            active[0].callback()
+
+        start = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+        midnight = datetime(2026, 11, 2, tzinfo=timezone.utc)
+        client = mock.Mock()
+        with mock.patch.object(reporting, '_new_client', return_value=client), \
+                mock.patch.object(reporting.threading, 'Timer', FakeTimer), \
+                mock.patch.object(reporting, 'datetime', wraps=datetime) as wall, \
+                mock.patch.object(frequency, '_now', return_value=start) as clock, \
+                mock.patch.object(frequency, 'flush', wraps=frequency.flush) as flush:
+            wall.now.return_value = start
+            reporting.save({'usage': True, 'errors': True})
+            self.assertEqual(timers[-1].delay, reporting.FREQUENCY_DEBOUNCE)
+            fire(start + timedelta(seconds=60))
+            self.assertEqual(client.transport.capture_envelope.call_count, 1)
+            self.assertEqual(reporting._frequency_due, midnight.timestamp())
+            self.assertEqual(timers[-1].delay, reporting.WALL_CLOCK_RECHECK)
+            calls = flush.call_count
+            fire(start + timedelta(seconds=60 + reporting.WALL_CLOCK_RECHECK))
+            self.assertEqual(flush.call_count, calls, "分段等待的中途不读写状态文件")
+            self.assertEqual(client.transport.capture_envelope.call_count, 1)
+            fire(midnight)
+            self.assertEqual(client.transport.capture_envelope.call_count, 2, "过了日界报当天的活跃")
+            reporting.capture('unhandled-main', ValueError('private'))
+            self.assertEqual(timers[-1].delay, reporting.FREQUENCY_DEBOUNCE, "新计数把定时器提前到防抖点")
+            fire(midnight + timedelta(seconds=60))
+            self.assertEqual(reporting._frequency_due, midnight.timestamp() + frequency.INTERVAL)
 
     def test_daily_activity_is_reported_after_midnight_without_restarting(self):
         client = mock.Mock()
@@ -565,7 +616,7 @@ class RemoteReportingTests(unittest.TestCase):
             reporting.capture('http-request', unsupported, status_code=501, route='api/pick-folder')
             send.assert_not_called()
             failed = HTTPException(501, 'private')
-            failed.__cause__ = PickerUnavailable('private')
+            failed.__cause__ = PickerUnavailable('errors.folderPicker.cannotOpen')
             reporting.capture('http-request', failed, status_code=501, route='api/pick-folder')
             send.assert_called_once()
             send.reset_mock()
@@ -581,22 +632,23 @@ class RemoteReportingTests(unittest.TestCase):
         from peach.browser_transport import BrowserUnavailable, ChallengeUnsolved
         from peach.jav_cover_fetch import CoverConnectError, DeadlineExceeded
         from peach.jobs import JobPaused, MeteredSourceDenied, DiskSpaceDenied, TaskRunConflict
-        from peach.metadata import MetadataProviderError
+        from peach.metadata import MetadataProviderError, relayed
         from peach.previews import PreviewUnavailable
         from peach.scraping_access import SourcePaused
         from peach.segments import SegmentCancelled
         from peach.sources.base import SourceFailure, FailureReason
         from peach.transcodes import TranscodeCancelled
         from starlette.requests import ClientDisconnect
-        errors = [asyncio.CancelledError(), CancelledError(), InterruptedError(), JobPaused(),
-                  MeteredSourceDenied(), DiskSpaceDenied(), TaskRunConflict('processing', 1),
-                  SourcePaused(), DeadlineExceeded(), CoverConnectError(), PreviewUnavailable(),
+        errors = [asyncio.CancelledError(), CancelledError(), InterruptedError(), JobPaused('errors.updateTasks.pausedForInstall'),
+                  MeteredSourceDenied('errors.jobs.meteredSourceDenied', {'location': 'x'}), DiskSpaceDenied('errors.upgradeRepairs.displayBackupNoSpace'), TaskRunConflict('processing', 1),
+                  SourcePaused('errors.scrapingAccess.coolingDown'), DeadlineExceeded('errors.javCoverFetch.deadline'),
+                  CoverConnectError('errors.javCoverFetch.hostsUnreachable'), PreviewUnavailable(*relayed('snapshot unavailable')),
                   SegmentCancelled(), TranscodeCancelled(), BrowserUnavailable(), ChallengeUnsolved(),
                   ClientDisconnect(),
-                  MetadataProviderError('auth', kind='auth'),
-                  MetadataProviderError('absent', kind='not_found'),
-                  MetadataProviderError('retry', kind='unavailable', retryable=True)]
-        errors += [SourceFailure(reason, 'source state') for reason in FailureReason
+                  MetadataProviderError('errors.javdb.loginRequired', kind='auth'),
+                  MetadataProviderError('errors.javdb.notFound', kind='not_found'),
+                  MetadataProviderError('errors.metadataAmane.bridgeTimeout', kind='unavailable', retryable=True)]
+        errors += [SourceFailure(reason, *relayed('HTTP 503')) for reason in FailureReason
                    if reason != FailureReason.PARSE_ERROR]
         with mock.patch.object(reporting, 'send') as send:
             for error in errors:
@@ -606,11 +658,12 @@ class RemoteReportingTests(unittest.TestCase):
             send.assert_not_called()
 
     def test_source_parser_and_unknown_provider_failures_are_actionable(self):
-        from peach.metadata import MetadataProviderError
+        from peach.metadata import MetadataProviderError, relayed
         from peach.sources.base import SourceFailure, FailureReason
-        errors = [SourceFailure(FailureReason.PARSE_ERROR, 'parser failure'),
-                  MetadataProviderError('parser failure', kind='unavailable', detail='parse_error'),
-                  MetadataProviderError('unknown failure')]
+        errors = [SourceFailure(FailureReason.PARSE_ERROR, 'errors.dmm.notWorkJson'),
+                  MetadataProviderError('errors.dmm.notWorkJson', kind='unavailable', detail='parse_error'),
+                  # amane 桥报告里的原文按默认分类转述（`metadata_amane._bridge_report`）。
+                  MetadataProviderError(*relayed('unknown failure'))]
         for error in errors:
             with self.subTest(error=type(error).__name__), mock.patch.object(reporting, 'send') as send:
                 reporting.capture('background-job', error)
@@ -749,7 +802,7 @@ class RemoteReportingTests(unittest.TestCase):
             made = library_processing._generate_previews(self.config, [row], mock.Mock(),
                 update=mock.Mock(), issue=issue, guard=mock.Mock())
         self.assertEqual(made, 0)
-        self.assertIn('FFmpeg', issue.call_args.args[1])
+        self.assertIn('FFmpeg', library_processing.phrase_text(issue.call_args.args[1]))
         self.assertTrue(issue.call_args.kwargs['retryable'])
         send.assert_not_called()
 

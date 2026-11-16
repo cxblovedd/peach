@@ -4,9 +4,11 @@ import { Button, ButtonLink } from '@/components/base/buttons/button';
 import { Input } from '@/components/base/input/input';
 import { ApiError, apiGet, apiSend } from '../../api';
 import { diagnosticHeaders } from '../../browser-diagnostics';
+import { withBackoff } from '../../polling';
 import { Fieldset, FieldsetTitle } from '../components/fieldset';
 import { Note } from '../components/note';
 import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { queryClient } from '../query';
 import { busyProps, useAction } from '../settings/use-action';
 import { t } from '../../i18n';
@@ -20,6 +22,9 @@ interface ExportState {
   stage?: string; stage_code?: string; done?: number; total?: number; files?: number; rows?: number; bytes?: number;
   download_url?: string; error?: string;
 }
+/** 导出在跑或在取消时每秒读一次进度，结束就停；读失败按连续失败次数退避。 */
+export const exportInterval = withBackoff<ExportState>((data) =>
+  (['running', 'cancelling'].includes(data?.status || '') ? 1000 : false));
 
 /** 导出按钮与它的进度、回执。刮削记录在卡片底栏里，进度复用卡片；诊断报告摆在页头，进度自己带框，
  *  `children` 是页头同一排的其他按钮。 */
@@ -28,7 +33,7 @@ export function DiagnosticExportAction({ kind, codes = '', children }: {
 }) {
   const action = useAction();
   const query = useQuery({ queryKey: KEY, queryFn: ({ signal }) => apiGet<ExportState>(URL, signal),
-    refetchInterval: query => ['running', 'cancelling'].includes(query.state.data?.status || '') ? 1000 : false });
+    refetchInterval: exportInterval });
   const state = query.data;
   const mine = state?.kind === kind;
   const active = state?.status === 'running' || state?.status === 'cancelling';
@@ -53,7 +58,7 @@ export function DiagnosticExportAction({ kind, codes = '', children }: {
         href={state.download_url}>{t('manage:diagnosticsExport.downloadFile')}</ButtonLink> : null}
       {children}
     </div>
-    {mine && active ? <TaskProgress embedded={kind === 'scraping'} value={state.done || 0} total={state.total}
+    {mine && active ? <TaskProgress embedded={kind === 'scraping'} kind={activityKind('diagnostic-export', state.stage_code)} value={state.done || 0} total={state.total}
       label={state.total ? t('manage:diagnosticsExport.progress', { stage: stageText(state), done: state.done || 0, count: state.total })
         : [stageText(state) || t('manage:diagnosticsExport.preparing'), state.rows ? t('manage:diagnosticsExport.candidateCount', { count: state.rows }) : '',
           state.files ? t('manage:diagnosticsExport.fileCount', { count: state.files }) : ''].filter(Boolean).join(' · ')} /> : null}

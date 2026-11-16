@@ -10,6 +10,8 @@
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 from . import media_libraries, settings_file
 from .follow_discovery import MAX_SUGGESTIONS, MAX_TERM_LENGTH
 from .review_csv import candidate_root_version
@@ -22,9 +24,11 @@ from .web_activity import (
     w_watch_later,
 )
 from .web_batch import q_ads, q_duplicates, w_batch, w_empty_trash
+from .web_entity_batch import q_entity_batch_plan, w_entity_batch
 from .web_performer_delete import q_performer_delete_candidates, q_performer_delete_plan, w_performer_delete
 from .web_tags import q_tag_management, w_tag_management, w_tag_preview
 from .taste_history import history_source_count
+from .taste_browsing import q_taste_signals
 from .web_catalog import (
     FACETS_TABLES,
     catalog_filter,
@@ -37,6 +41,7 @@ from .web_catalog import (
     q_tops,
     w_item_tag,
 )
+from .web_item_edit import w_item_edit
 from .web_entity import (
     FEED_SHAPE_TABLES,
     SUGGEST_GROUP_LIMIT,
@@ -46,12 +51,14 @@ from .web_entity import (
     entity_shapes,
     q_entity,
     q_entity_latest,
+    q_entity_merge,
     q_entity_photos,
     q_index,
     q_photo_set,
     q_suggest,
     suggest_kinds,
     w_entity_alias,
+    w_entity_merge,
     w_entity_name,
 )
 from .web_downloads import (q_downloads, w_download_cancel, w_download_postprocess,
@@ -69,6 +76,7 @@ from .web_feeds import (
     q_feeds,
     w_feed_check,
     w_feed_discovery,
+    w_feed_schedule,
     w_feed_schedule_run,
     w_feed_source,
 )
@@ -375,6 +383,7 @@ GET_HANDLERS = {
     "/api/jav/discoveries": q_jav_discoveries,
     "/api/jav/discoveries/metadata": q_jav_discovery_metadata,
     "/api/jav/releases": q_jav_releases,
+    "/api/taste/signals": q_taste_signals,
     "/api/library-processing": q_library_processing,
     "/api/library-processing/issues": q_library_processing_issues,
     "/api/thumbnail-jobs": q_thumbnail_jobs,
@@ -411,7 +420,9 @@ GET_HANDLERS = {
     "/api/parts": q_parts,
     "/api/editions": q_editions,
     "/api/entity": q_entity,
+    "/api/entity-merge": q_entity_merge,
     "/api/performer/delete-plan": q_performer_delete_plan,
+    "/api/entity-batch/plan": q_entity_batch_plan,
     "/api/performer/delete-candidates": q_performer_delete_candidates,
     "/api/entity/shapes": _get_entity_shapes,
     "/api/entity/latest": q_entity_latest,
@@ -463,6 +474,7 @@ POST_HANDLERS = {
     "/api/feeds/check": w_feed_check,
     "/api/feeds/source": w_feed_source,
     "/api/feeds/discovery": w_feed_discovery,
+    "/api/feeds/schedule": w_feed_schedule,
     "/api/feeds/schedule/run": w_feed_schedule_run,
     "/api/follow/check": w_follow_check,
     "/api/follow/schedule": w_follow_schedule,
@@ -489,6 +501,7 @@ POST_HANDLERS = {
     "/api/quality-goal": w_quality_goal,
     "/api/wants": w_wants,
     "/api/item-tag": w_item_tag,
+    "/api/item-edit": w_item_edit,
     "/api/batch": w_batch,
     "/api/search-history": w_search_history,
     "/api/taste/refresh": w_taste_refresh,
@@ -512,7 +525,9 @@ POST_HANDLERS = {
     "/api/tutorial-progress": w_tutorial_progress,
     "/api/entity-name": w_entity_name,
     "/api/performer/delete": w_performer_delete,
+    "/api/entity-batch": w_entity_batch,
     "/api/entity-alias": w_entity_alias,
+    "/api/entity-merge": w_entity_merge,
     "/api/face-models": _post_face_models,
 }
 
@@ -541,13 +556,20 @@ READ_ONLY_POST_ROUTES = frozenset({
 # 在只读端本来就不写。
 
 
+#: 用户在页面上点开才发的读请求：库外详情、评论与磁链、查找资源弹层、按名字搜 JavDB 演员。
+#: 只有这几条带登录账号的 Cookie（`scraping_access.with_account`），后台任务一律匿名取页。
+ACCOUNT_ROUTES = frozenset({"/api/resources/search", "/api/jav/detail", "/api/jav/reviews", "/api/jav/resources",
+                            "/api/feeds/lookup"})
+
+
 def dispatch_api_get(contract: WebContract, path, args):
     """Dispatch the stable JSON read contract used by the current web client."""
+    from .scraping_access import with_account
     try:
         handler = GET_HANDLERS[path]
     except KeyError as exc:
         raise ContractRouteNotFound(path) from exc
-    with revision_snapshot():
+    with revision_snapshot(), (with_account() if path in ACCOUNT_ROUTES else nullcontext()):
         return handler(contract, args)
 
 

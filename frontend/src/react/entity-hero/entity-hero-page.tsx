@@ -32,7 +32,7 @@ import {
   type EntityHeroActions, type EntityHeroData, type EntityHeroHelpers, type EntityHeroProps,
   type HeroCostar, type HeroFollow, type LinkMark, type LinkView,
 } from './entity-hero';
-import { serverLabels } from '../../core/server-text';
+import { codedText, serverLabels } from '../../core/server-text';
 import { interfaceLanguage, t } from '../../i18n';
 
 /** 译文里数字的占位记号：`{{num}}` 先代入它，再按它切开放进 `<b>`。 */
@@ -86,7 +86,7 @@ export function EntityHeroPage({ kind, name, entity, feedNew, feedHost, feedErro
             <div data-entity-title="">
               <h2 lang={textLang(displayName)}>{displayName}</h2>
               {kind !== 'tag' ? <NamePicker current={entity.canonical_name} choices={nameChoices(entity, nameLanguage())}
-                onChoose={actions.chooseName} onAddAlias={actions.addAlias} /> : null}
+                onChoose={actions.chooseName} onAddAlias={actions.addAlias} onMerge={actions.mergeDuplicate} /> : null}
               {entity.id ? <FavoriteButton item={{ entity_id: Number(entity.id), kind, name: entity.canonical_name || name, favorite: entity.favorite }} /> : null}
             </div>
             <PendingWork work={entity.pending_work} />
@@ -200,7 +200,7 @@ function AliasLine({ kind, entity, actions }: { kind: string; entity: EntityHero
                 heading={t('catalog:entityHero.aliasCount', { count: line.total })}>
                 <dl>
                   {(groups?.groups || []).map((group, at) => (
-                    <NameGroup key={at} label={group.label} names={group.names} />
+                    <NameGroup key={at} label={codedText(group, 'label')} names={group.names} />
                   ))}
                 </dl>
               </MorePop>

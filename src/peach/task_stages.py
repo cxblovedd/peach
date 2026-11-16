@@ -12,9 +12,10 @@ from functools import lru_cache
 from . import interface_text
 
 STAGE_NAMES = {
-    "library": ("scanFiles", "checkCompanions", "probeMedia", "checkNetwork", "checkJunk", "recheckJunk",
-                "prepareImages", "readImages", "preparePreviews", "makePreviews", "prepareMetadata",
-                "prepareSources", "fetchMetadata", "saveCandidates", "fetchCovers", "collectResults", "finished"),
+    "library": ("startAll", "startScan", "startCollect", "startPreviews", "scanFiles", "checkCompanions",
+                "probeMedia", "checkNetwork", "checkJunk", "recheckJunk", "prepareImages", "readImages",
+                "preparePreviews", "makePreviews", "prepareMetadata", "prepareSources", "fetchMetadata",
+                "saveCandidates", "fetchCovers", "collectResults", "fillPerformerProfiles", "finished"),
     "backup": ("prepareBackup", "copyLedger", "checkIntegrity", "backupDone", "prepareRestore", "copyBackup",
                "migrateBackup", "saveCurrent", "writeLedger", "restoreDone"),
     "diagnostics": ("prepare", "readSystem", "collectLogs", "collectEvidence", "readCandidates",
@@ -73,7 +74,8 @@ def stage_label(code: str) -> dict:
 
 #: 批量操作的 id。名字在 `server.json` 的 `batchOperation.<operation>`。按女优删除影片走自己的入口，也登记在这里。
 BATCH_OPERATIONS = ("like", "seen", "later", "dispose", "restore", "delete", "dismiss-junk", "reconsider-junk",
-                    "keep-duplicates", "reconsider-duplicates", "region", "performer-delete")
+                    "keep-duplicates", "reconsider-duplicates", "region", "performer-delete",
+                    "revert-like", "revert-seen", "revert-later")
 
 
 def batch_progress(operation: str) -> dict:

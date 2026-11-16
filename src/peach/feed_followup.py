@@ -37,13 +37,15 @@ from pathlib import Path
 from . import feeds, metadata_routes
 from .catalog_rules import normalise_code_key
 from .followups import Followup, FollowupType, register
-from .task_runs import item_progress, run_progress
+from .task_runs import item_progress, run_progress, task_label
 from .metadata import extract_peach_fields
+from .user_messages import UserFacingError, UserValueError
+from . import interface_text
 
 TASK_KEY = "feed-scrape"
-TASK_LABEL = "新作资料采集"
+TASK_LABEL = task_label(TASK_KEY)
 COVER_TASK_KEY = "feed-cover"
-COVER_TASK_LABEL = "新作封面采集"
+COVER_TASK_LABEL = task_label(COVER_TASK_KEY)
 LABELS = {TASK_KEY: TASK_LABEL, COVER_TASK_KEY: COVER_TASK_LABEL}
 
 #: 一条资料够用就停。四个标量都拿到就不再问下一家——Feed 是后台跑的，
@@ -75,7 +77,7 @@ def parse_key(key: str, task_key: str = TASK_KEY) -> list[str]:
     prefix, _, body = str(key).partition(":")
     codes = [code for code in body.split(",") if code]
     if prefix != task_key or not codes:
-        raise ValueError(f"认不出这条{LABELS.get(task_key, task_key)}后继：{key}")
+        raise ValueError(f"unrecognized {task_key} followup key: {key}")
     return codes
 
 
@@ -119,10 +121,14 @@ def has_local_cover(cover_root: Path, code: str) -> bool:
 
 def scrape_batch(connection, fresh=(), *, exclude=(), now: datetime | None = None,
                  retry_after: timedelta = RETRY_AFTER,
-                 hidden: frozenset[str] = feeds.DEFAULT_HIDDEN_COMPILATIONS) -> list[str]:
+                 hidden: frozenset[str] = feeds.DEFAULT_HIDDEN_COMPILATIONS,
+                 cover_root: Path | None = None) -> list[str]:
     """下一批取资料的番号：这一轮新发现的 `fresh` 与还没取过资料的壳在前，上次没取到、
     已经过了 `retry_after` 的壳在后，并且至少留 `RETRY_SHARE` 个名额给后者。不在这一批里、
     只缺封面的归 `cover_backlog`。
+
+    给了 `cover_root` 时，还没封面、上次取资料已过 `retry_after` 的蓝光版也算重试：
+    并入配信版（`fold_bluray_edition`）要写壳，只有这一条通道写账本。
 
     已忽略的不算：人说了不想看，就不再替它花配额。已经入库的壳本来就不在表里
     （入库即从列表里消失，ADR-0042 第三条），这里同样用番号键排除掉。取回标题后认出是
@@ -137,8 +143,17 @@ def scrape_batch(connection, fresh=(), *, exclude=(), now: datetime | None = Non
                      skip, hidden, MAX_BATCH)
     retries = _first(_candidates(connection, "d.scrape_error IS NOT NULL AND d.scraped_at<?",
                                  (cutoff,), "d.scraped_at, "), skip, hidden, MAX_BATCH)
+    if cover_root is not None:
+        retries += [row["code"] for row in _visible(_candidates(
+            connection, "d.scrape_error IS NULL AND d.scraped_at<?", (cutoff,), "d.scraped_at, "), skip, hidden)
+            if _bluray_without_cover(row, cover_root) and row["code"] not in retries][:MAX_BATCH]
     head = [*fresh, *untried][:MAX_BATCH - min(len(retries), RETRY_SHARE)]
     return head + retries[:MAX_BATCH - len(head)]
+
+
+def _bluray_without_cover(row, cover_root: Path) -> bool:
+    from .jav_editions import bluray_title
+    return bluray_title(row["title"]) and not has_local_cover(cover_root, row["code"])
 
 
 def _first(rows, exclude, hidden, limit: int) -> list[str]:
@@ -155,8 +170,8 @@ def cover_backlog(connection, cover_root: Path, *, exclude=(), now: datetime | N
                   hidden: frozenset[str] = feeds.DEFAULT_HIDDEN_COMPILATIONS) -> list[str]:
     """本机还没有封面、上次取图已经过了 `retry_after` 的壳，资料齐了的和还没取过资料的都算。
 
-    上次没取到资料的不算：它归 `scrape_batch` 重试，取完资料就地补封面。调用方把这一批
-    取资料的番号放进 `exclude`，同一部不两头都派。
+    上次没取到资料的不算：它归 `scrape_batch` 重试，取完资料就地补封面；缺封面的蓝光版也归它，
+    先并入配信版再取图。调用方把这一批取资料的番号放进 `exclude`，同一部不两头都派。
     上次取图的时间读逐番号的取图记录（`record_cover_attempt`），没试过的排最前，其余由远到近；
     同样远的新片在前。排除规则与 `scrape_batch` 相同。
     """
@@ -168,7 +183,8 @@ def cover_backlog(connection, cover_root: Path, *, exclude=(), now: datetime | N
     for position, row in enumerate(_visible(rows, exclude, hidden)):
         code = row["code"]
         key = normalise_code_key(code)
-        if not key or is_korean_mib_code(key) or has_local_cover(cover_root, code):
+        if (not key or is_korean_mib_code(key) or has_local_cover(cover_root, code)
+                or _bluray_without_cover(row, cover_root)):
             continue
         try:
             attempted = cover_attempt_path(cover_root, key).stat().st_mtime
@@ -183,7 +199,7 @@ def _candidates(connection, condition: str, values: tuple, order: str):
     return connection.execute(
         "SELECT d.code,d.title,d.performers,d.studio FROM feed_discovery d"
         f" WHERE d.ignored_at IS NULL AND {condition}"
-        " AND NOT EXISTS (SELECT 1 FROM asset a WHERE a.code IS NOT NULL"
+        " AND NOT EXISTS (SELECT 1 FROM asset a WHERE a.medium='video' AND a.code IS NOT NULL"
         " AND COALESCE(a.disposal,'')<>'vanished'"
         " AND normalise_code_key(a.code)=normalise_code_key(d.code))"
         f" ORDER BY {order}COALESCE(d.release_date,d.discovered_at) DESC, d.id DESC",
@@ -235,8 +251,8 @@ def collect(provider, code: str) -> tuple[dict, str | None]:
             code, deadline=deadline_after(budget),
             route=metadata_routes.community_route(code))
     except DeadlineExceeded as error:
-        raise DeadlineExceeded(
-            f"来源链 {'、'.join(chain)} 在 {budget:g} 秒内没有答复") from error
+        raise DeadlineExceeded("errors.feedFollowup.chainTimedOut",
+                               {"chain": _chain(chain), "seconds": f"{budget:g}"}) from error
     fields: dict[str, object] = {}
     cover: str | None = None
     for _source, payload in found:
@@ -249,7 +265,7 @@ def collect(provider, code: str) -> tuple[dict, str | None]:
         if all(name in fields for name in WANTED):
             break
     if not fields and cover is None:
-        raise ValueError(f"来源链 {'、'.join(chain)} 上都没有这个番号的资料")
+        raise UserValueError("errors.feedFollowup.noMetadata", {"chain": _chain(chain)})
     return fields, cover
 
 
@@ -312,16 +328,21 @@ def awaiting_official_cover(contract, code: str, release_date: str | None) -> bo
     新作列表先不放它，`/cover-image` 也不代理那张占位图；`cover_backlog` 照旧按 `RETRY_AFTER`
     重取，官方出图、本机有了封面就回到列表里。已发售的旧作不算：官方那几个地址里常有一张
     偏窄的真封面，取图记录照样写成占位图。"""
-    from .jav_cover_fetch import PLACEHOLDER_MARK
+    from .jav_cover_fetch import OFFICIAL_PLACEHOLDER_ONLY, OFFICIAL_PLACEHOLDER_ONLY_CODE, PLACEHOLDER_CODE, PLACEHOLDER_REASON
     if not release_date or str(release_date)[:10] <= datetime.now().date().isoformat():
         return False
     if contract.has_cover(code):
         return False
     attempt = cover_attempt(contract.cover_root, code)
-    return bool(attempt and not attempt.get("ok") and PLACEHOLDER_MARK in str(attempt.get("reason") or ""))
+    if not attempt or attempt.get("ok"):
+        return False
+    # 记录里的 `reason` 是 zh-CN 原文；原因嵌在别的说法里（「DMM：…」）时也认得出。
+    reason = str(attempt.get("reason") or "")
+    return (attempt.get("reason_code") in (PLACEHOLDER_CODE, OFFICIAL_PLACEHOLDER_ONLY_CODE)
+            or any(text in reason for text in (PLACEHOLDER_REASON, OFFICIAL_PLACEHOLDER_ONLY)))
 
 
-def cover_states(contract, rows) -> dict[str, tuple[str, str]]:
+def cover_states(contract, rows) -> dict[str, tuple[str, dict | str]]:
     """本机还没有封面的新作，封面那一格说什么：番号键 → (状态, 原因)。
 
     状态只有三档，判据与后台真的会怎么处理它一致，不让卡片说一套、队列做一套：
@@ -330,10 +351,11 @@ def cover_states(contract, rows) -> dict[str, tuple[str, str]]:
     - `queued`：排在某条队里，或者 `cover_backlog` 下一轮会捞走它（资料没出错、没忽略、从没取过图）。
     - `missing`：取过没取到，或者后台不会替它取。原因用取图记录里那句（已去掉来源地址）。
 
+    原因是 `{code, params}` 那一句（`cover_state_fields` 拆成字段），旧取图记录只有原文时是原文。
     `rows` 是壳的行，至少带 `code`、`scrape_error`、`ignored_at`。
     """
     from .catalog_rules import is_korean_mib_code
-    from .jav_cover_fetch import MIB_NOT_JAV
+    from .jav_cover_fetch import MIB_NOT_JAV_CODE
 
     running = in_flight(contract.task_runs, "running")
     covers = in_flight(contract.task_runs, "pending", (COVER_TASK_KEY,))
@@ -345,24 +367,60 @@ def cover_states(contract, rows) -> dict[str, tuple[str, str]]:
             continue
         attempt = cover_attempt(contract.cover_root, key)
         if key in running:
-            states[key] = ("fetching", "正在取这一部的封面")
+            states[key] = ("fetching", _said("fetching"))
         elif is_korean_mib_code(key):
-            states[key] = ("missing", MIB_NOT_JAV)
+            states[key] = ("missing", {"code": MIB_NOT_JAV_CODE, "params": {}})
         elif key in covers:
-            states[key] = ("queued", "排在新作封面采集的队里")
+            states[key] = ("queued", _said("queuedCover"))
         elif key in scrapes:
-            states[key] = ("queued", "排在新作资料采集后面，资料取完就取封面")
+            states[key] = ("queued", _said("queuedAfterScrape"))
         elif attempt is not None and attempt.get("ok"):
-            states[key] = ("missing", "取到过的封面已不在本机，到了重试时间再取")
+            states[key] = ("missing", _said("coverGone"))
         elif attempt is not None:
-            states[key] = ("missing", f"上次没取到：{attempt.get('reason') or '封面处理未完成'}")
+            states[key] = ("missing", _said("lastAttemptFailed", reason=attempt_reason(attempt)))
         elif row.get("ignored_at"):
-            states[key] = ("missing", "已标为不想看，后台不再替它取图")
+            states[key] = ("missing", _said("ignored"))
         elif row.get("scrape_error"):
-            states[key] = ("missing", "资料没取到，到了重试时间连同封面再试")
+            states[key] = ("missing", _said("scrapeFailed"))
         else:
-            states[key] = ("queued", "等下一轮订阅检查分批取图")
+            states[key] = ("queued", _said("nextCheck"))
     return states
+
+
+def _chain(names) -> dict | str:
+    """来源链写成报错里的一个参数：`labels.feedFollowup.chainLink` 一层套一层，分隔符在资源里，各语言自己定。"""
+    names = [str(name) for name in names]
+    said: dict | str = names[-1] if names else ""
+    for head in reversed(names[:-1]):
+        said = {"code": "labels.feedFollowup.chainLink", "params": {"first": head, "rest": said}}
+    return said
+
+
+def _said(name: str, /, **params) -> dict:
+    """封面格原因的一句：`labels.feedFollowup.cover.<名字>`。"""
+    return {"code": f"labels.feedFollowup.cover.{name}", "params": params}
+
+
+#: 封面格原因的名字（`_said`），文字在 `server.json` 的 `labels.feedFollowup.cover.*`。
+COVER_REASONS = ("fetching", "queuedCover", "queuedAfterScrape", "coverGone", "lastAttemptFailed", "ignored",
+                 "scrapeFailed", "nextCheck", "unfinished", "connectFailed")
+
+
+def attempt_reason(attempt: dict) -> dict | str:
+    """取图记录里那次没取到的原因：带 code 的是那一句，旧记录只有原文时是原文，什么都没记时是「封面处理未完成」。"""
+    if attempt.get("reason_code"):
+        return {"code": attempt["reason_code"], "params": dict(attempt.get("reason_params") or {})}
+    return attempt.get("reason") or _said("unfinished")
+
+
+def cover_state_fields(states: dict, code: str) -> dict:
+    """新作卡封面格的字段：`cover_state`（`fetching`／`queued`／`missing`，有封面时为 None）、
+    `cover_reason`（zh-CN 原文）与 `cover_reason_code`／`cover_reason_params`。"""
+    state, said = states.get(normalise_code_key(code), (None, ""))
+    if isinstance(said, dict):
+        return {"cover_state": state, "cover_reason": interface_text.text(f"server:{said['code']}", said["params"]),
+                "cover_reason_code": said["code"], "cover_reason_params": said["params"]}
+    return {"cover_state": state, "cover_reason": said}
 
 
 def cover_attempt(cover_root: Path, code: str) -> dict | None:
@@ -386,10 +444,37 @@ def record_cover_attempt(contract, code: str, *, ok: bool, error=None):
         from .javdb_public import PublicSourceUnavailable
         from .remote_media_cache import RemoteMediaUnavailable
         import httpx
-        reason = (re.sub(r'https?://\S+', '来源地址', str(error)) if isinstance(error, (Unavailable, PublicSourceUnavailable, RemoteMediaUnavailable))
-                  else '来源连接失败' if isinstance(error, httpx.TransportError) else '封面处理未完成')
-        record.update(error_type=type(error).__name__, reason=reason[:300])
+        if isinstance(error, (Unavailable, PublicSourceUnavailable, RemoteMediaUnavailable)):
+            said = ({"code": error.code, "params": _scrubbed(error.params)} if isinstance(error, UserFacingError)
+                    else _URL.sub(interface_text.text(f"server:{SOURCE_ADDRESS_CODE}"), str(error)))
+        else:
+            said = _said("connectFailed" if isinstance(error, httpx.TransportError) else "unfinished")
+        record["error_type"] = type(error).__name__
+        if isinstance(said, dict):
+            record.update(reason=interface_text.text(f"server:{said['code']}", said["params"])[:300],
+                          reason_code=said["code"], reason_params=said["params"])
+        else:
+            record["reason"] = said[:300]
     atomic_write_text(path, json.dumps(record, ensure_ascii=False))
+
+
+#: 取图记录里代替网址的那一句。
+SOURCE_ADDRESS_CODE = "labels.feedFollowup.sourceAddress"
+_URL = re.compile(r'https?://\S+')
+
+
+def _scrubbed(params: dict) -> dict:
+    """取图记录不留来源地址：参数里的网址（可能带凭据）换掉，嵌套的那一句逐层换。整个参数就是网址时换成嵌套的
+    `SOURCE_ADDRESS_CODE` 一句，界面按当前语言显示「来源地址」；网址夹在别的文字里时只能换成 zh-CN 那几个字。"""
+    def clean(value):
+        if isinstance(value, str):
+            if _URL.fullmatch(value.strip()):
+                return {"code": SOURCE_ADDRESS_CODE}
+            return _URL.sub(interface_text.text(f"server:{SOURCE_ADDRESS_CODE}"), value)
+        if isinstance(value, dict):
+            return {key: clean(item) for key, item in value.items()}
+        return value
+    return clean(dict(params))
 
 
 def ensure_cover(contract, code: str, cover_url: str | None = None) -> bool:
@@ -429,6 +514,46 @@ def performer_names(value: object) -> list[str]:
         return [str(item.get("name") or "") if isinstance(item, dict) else str(item)
                 for item in value]
     return []
+
+
+def _shell(contract, condition: str, value):
+    with contract.database.read_connection() as connection:
+        return connection.execute(
+            "SELECT id,code,title,performers,scraped_at,scrape_error FROM feed_discovery"
+            f" WHERE {condition}", (value,)).fetchone()
+
+
+def fold_bluray_edition(contract, row) -> str | None:
+    """还没封面的蓝光版壳并入 DMM 配信版，返回之后按哪个番号接着取；这一条删掉了返回 None。
+
+    蓝光版另有品番（GRABD-039），官方封面按番号取不到，配信版（GRACE-039）是同一部片、同一张封套。
+    配信版已在列表里或已入库，这一条就是重复，删掉；否则把壳改成配信版番号，资料与封面按它重取，
+    已读、已忽略照旧。问不到 DMM 或对不上时原样留着，到了重试时间再问。
+    """
+    from .jav_editions import bluray_title, digital_edition
+
+    code = row["code"]
+    if not bluray_title(row["title"]) or has_local_cover(contract.cover_root, code):
+        return code
+    names = [name for name in re.split(r"[、,]", row["performers"] or "") if name.strip()]
+    try:
+        digital = normalise_code_key(digital_edition(row["title"], names, contract.follow_secrets_root))
+    except Exception:  # noqa: BLE001 - 问不到就当这次没对上，壳原样留着
+        return code
+    if not digital or digital == normalise_code_key(code):
+        return code
+    shell = int(row["id"])
+    with contract.database.write_transaction() as connection:
+        if feeds.in_library(connection, digital) or connection.execute(
+                "SELECT 1 FROM feed_discovery WHERE normalise_code_key(code)=? AND id<>?",
+                (digital, shell)).fetchone():
+            # 连接的 `PRAGMA foreign_keys` 是 OFF，子表的 `ON DELETE CASCADE` 要显式做。
+            connection.execute("DELETE FROM feed_discovery_entity WHERE discovery_id=?", (shell,))
+            connection.execute("DELETE FROM feed_discovery WHERE id=?", (shell,))
+            return None
+        connection.execute("UPDATE feed_discovery SET code=?,cover_url=NULL,scraped_at=NULL,scrape_error=NULL"
+                           " WHERE id=?", (digital, shell))
+    return digital
 
 
 def _scrape_fields(contract, provider, row) -> bool:
@@ -483,12 +608,13 @@ def run(contract, key: str, handle) -> dict:
             continue
         handle.progress(current=index, total=len(codes),
                         **item_progress(TASK_KEY, code), throttle=0)
-        with contract.database.read_connection() as connection:
-            row = connection.execute(
-                "SELECT id,code,scraped_at,scrape_error FROM feed_discovery WHERE code=?",
-                (code,)).fetchone()
+        row = _shell(contract, "code=?", code)
+        if row is not None and fold_bluray_edition(contract, row) is not None:
+            row = _shell(contract, "id=?", int(row["id"]))
+        else:
+            row = None
         if row is None:
-            # 壳被删了，或者这个番号这中间已经入库。两种都不该再取一遍。
+            # 壳被删了、并进了配信版，或者这个番号这中间已经入库。都不该再取一遍。
             continue
         if row["scraped_at"] is None or row["scrape_error"] is not None:
             provider = provider or LibraryMetadataProvider(contract.follow_secrets_root)
@@ -501,7 +627,7 @@ def run(contract, key: str, handle) -> dict:
             cover_url = connection.execute(
                 "SELECT cover_url FROM feed_discovery WHERE id=?", (int(row["id"]),)).fetchone()
         try:
-            covers += ensure_cover(contract, code, cover_url[0] if cover_url else None)
+            covers += ensure_cover(contract, row["code"], cover_url[0] if cover_url else None)
         except (CoverConnectError, httpx.TransportError):
             unreachable += 1
         except Exception:  # noqa: BLE001 - 取不到封面这一部照样有资料，下一轮再试

@@ -49,6 +49,8 @@ from typing import Callable
 from .fsutil import atomic_write_text
 from .repository import in_background
 from .discovery_rules import system_path
+from . import interface_text, media_io
+from .user_messages import UserFacingError, UserValueError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -67,6 +69,8 @@ MAX_WORKERS = 1
 #: 待办清单落盘的最短间隔。事件风暴时每来一条就重写一遍几千条的清单不值得；进程被强行结束时
 #: 最多丢这么久之内收下的。
 JOURNAL_SECONDS = 2.0
+#: 设置页保存后最多等本地监视起好这么久再回话；每个来源判在线要起一个读取子进程。
+LOCAL_START_WAIT_SECONDS = 5.0
 #: 待办清单的落点，与设置同在状态目录。
 PENDING_FILENAME = "push-discovery-pending.json"
 
@@ -93,7 +97,7 @@ CLOUD_ACTIONS = frozenset({"create", "rename"})
 _TRUE_WORDS = frozenset({"true", "1", "yes"})
 
 
-class CloudPathError(ValueError):
+class CloudPathError(UserFacingError, ValueError):
     """云端路径映射不出账本路径。消息可以直接给人看。"""
 
 
@@ -120,10 +124,10 @@ def _clean_segments(tail: str) -> tuple[str, ...]:
             continue
         if (segment == ".." or "\\" in segment or ":" in segment
                 or any(character < " " for character in segment)):
-            raise CloudPathError(f"✗ 云端路径里有不能接受的层级：{segment!r}")
+            raise CloudPathError("errors.pushDiscovery.badSegment", {"segment": repr(segment)})
         parts.append(segment)
     if not parts:
-        raise CloudPathError("✗ 云端路径在前缀之后没有内容")
+        raise CloudPathError("errors.pushDiscovery.nothingAfterPrefix")
     return tuple(parts)
 
 
@@ -244,7 +248,7 @@ def map_cloud_path(cloud_path: str, prefixes: tuple[CloudPrefix, ...]) -> str:
     """
     text = str(cloud_path or "").strip().replace("\\", "/")
     if not text:
-        raise CloudPathError("✗ 请求里没有云端路径")
+        raise CloudPathError("errors.pushDiscovery.noCloudPath")
     while "//" in text:
         text = text.replace("//", "/")
     if not text.startswith("/"):
@@ -253,15 +257,17 @@ def map_cloud_path(cloud_path: str, prefixes: tuple[CloudPrefix, ...]) -> str:
     for entry in prefixes:
         prefix = normalise_prefix(entry.prefix)
         if text == prefix:
-            raise CloudPathError("✗ 云端路径就是前缀本身，没有文件")
+            raise CloudPathError("errors.pushDiscovery.pathIsPrefix")
         if not text.startswith(prefix + "/"):
             continue
         depth = len(prefix)
         if best is None or depth > best[0]:
             best = (depth, entry, text[len(prefix):])
     if best is None:
-        known = "、".join(normalise_prefix(entry.prefix) for entry in prefixes) or "（一条都没配）"
-        raise CloudPathError(f"✗ {text} 不在任何已配置的前缀下；已知：{known}")
+        known = [normalise_prefix(entry.prefix) for entry in prefixes]
+        if not known:
+            raise CloudPathError("errors.pushDiscovery.noPrefixes", {"path": text})
+        raise CloudPathError("errors.pushDiscovery.notUnderPrefix", {"path": text, "known": known})
     return str(PureWindowsPath(best[1].root).joinpath(*_clean_segments(best[2])))
 
 
@@ -303,9 +309,12 @@ class DiscoveryQueue:
         debounce: float = DEBOUNCE_SECONDS, settle: float = SETTLE_SECONDS,
         timeout: float = SETTLE_TIMEOUT_SECONDS, max_pending: int = MAX_PENDING,
         journal: Path | None = None, journal_seconds: float = JOURNAL_SECONDS,
+        probe_many: Callable[[list[tuple[str, str]]], list] | None = None,
     ):
         self.ingest = ingest
         self.probe = probe
+        #: 一次探一批，按序回大小、None 或 OSError；给了就不再逐条调 `probe`。
+        self.probe_many = probe_many
         self.debounce = debounce
         self.settle = settle
         self.timeout = timeout
@@ -365,17 +374,38 @@ class DiscoveryQueue:
         """把到期的待办推进一步，返回这一轮实际登记的条数。"""
         with self._lock:
             ready = [entry for entry in self._pending.values() if entry.due <= now]
-        done = 0
+        live = []
         for entry in ready:
-            done += self._advance(entry, now)
+            if now - entry.first_seen > self.timeout:
+                self._forget(entry)
+                self.counters.timed_out += 1
+            else:
+                live.append(entry)
+        done = 0
+        for entry, size in zip(live, self._sizes(live)):
+            done += self._advance(entry, now, size)
         return done
 
-    def _advance(self, entry: _Pending, now: float) -> int:
-        if now - entry.first_seen > self.timeout:
-            self._forget(entry)
-            self.counters.timed_out += 1
+    def _sizes(self, entries: list[_Pending]) -> list:
+        """这一轮到期各条的大小：数字、None（明确不在）或 OSError（没答上）。"""
+        if self.probe_many is not None:
+            return self.probe_many([(entry.location, entry.path) for entry in entries])
+        sizes = []
+        for entry in entries:
+            try:
+                sizes.append(self.probe(entry.location, entry.path))
+            except OSError as error:
+                sizes.append(error)
+        return sizes
+
+    def _advance(self, entry: _Pending, now: float, size) -> int:
+        if isinstance(size, OSError):
+            # 读不了、超时：不知道文件在不在，不当成没了。隔一个静置窗口再测，
+            # 一直答不上就由 `timeout` 交回全量扫描。
+            with self._lock:
+                entry.size = None
+                entry.due = now + self.settle
             return 0
-        size = self.probe(entry.location, entry.path)
         if size is None:
             self._forget(entry)
             self.counters.missing += 1
@@ -394,7 +424,7 @@ class DiscoveryQueue:
             wrote = (self.ingest(entry.location, entry.path, entry.move_from) if entry.move_from
                      else self.ingest(entry.location, entry.path))
         except Exception as error:  # 一条路径失败不该带走整条队列
-            LOGGER.exception("推送发现登记失败：%s", entry.path)
+            LOGGER.exception("Push discovery registration failed: %s", entry.path)
             self.counters.failed += 1
             self.last_error = str(error)
             return 0
@@ -424,7 +454,7 @@ class DiscoveryQueue:
         except FileNotFoundError:
             return 0
         except (OSError, ValueError):
-            LOGGER.warning("推送发现的待办清单读不出来，跳过：%s", self.journal)
+            LOGGER.warning("Could not read the push discovery queue, skipping: %s", self.journal)
             return 0
         restored = 0
         for row in rows if isinstance(rows, list) else ():
@@ -456,7 +486,7 @@ class DiscoveryQueue:
             else:
                 self.journal.unlink(missing_ok=True)
         except OSError:
-            LOGGER.warning("推送发现的待办清单写不进去：%s", self.journal, exc_info=True)
+            LOGGER.warning("Could not write the push discovery queue: %s", self.journal, exc_info=True)
             with self._lock:
                 self._dirty = True
 
@@ -564,10 +594,12 @@ def _prefix_rows(raw, declared_roots) -> tuple[CloudPrefix, ...]:
             continue
         settled = known.get(root.casefold())
         if settled is None:
-            shown = "、".join(sorted(known.values())) or "（设置文件里一个都没有）"
-            raise ValueError(f"{root} 不是已声明的媒体根；已知：{shown}")
+            if not known:
+                raise UserValueError("errors.pushDiscovery.noDeclaredRoots", {"root": root})
+            shown = sorted(known.values())
+            raise UserValueError("errors.pushDiscovery.undeclaredRoot", {"root": root, "known": shown})
         if prefix in seen:
-            raise ValueError(f"前缀 {prefix} 登记了不止一次")
+            raise UserValueError("errors.pushDiscovery.duplicatePrefix", {"prefix": prefix})
         seen.add(prefix)
         rows.append(CloudPrefix(prefix, settled))
     return tuple(rows)
@@ -585,7 +617,7 @@ class PushDiscoverySettings:
         except FileNotFoundError:
             return PushDiscoveryConfig(enabled=True, cloud=False)
         except (OSError, ValueError):
-            LOGGER.warning("推送发现设置读不出来，按默认值跑：%s", self.path)
+            LOGGER.warning("Could not read push discovery settings, using defaults: %s", self.path)
             return PushDiscoveryConfig()
         if not isinstance(payload, dict):
             return PushDiscoveryConfig()
@@ -594,7 +626,7 @@ class PushDiscoverySettings:
         except ValueError:
             # 存进去的时候核对过；此刻对不上多半是媒体根改了。宁可让云端通道空转，
             # 也不要拿一张过期的表往账本里写路径。
-            LOGGER.warning("推送发现的前缀表与当前媒体根对不上，云端通道按未配置处理")
+            LOGGER.warning("Push discovery prefix table does not match the current media roots; treating the cloud channel as unconfigured")
             prefixes = ()
         return PushDiscoveryConfig(
             enabled=payload.get("enabled") is True,
@@ -605,7 +637,7 @@ class PushDiscoverySettings:
 
     def save(self, body: dict, declared_roots) -> PushDiscoveryConfig:
         if not isinstance(body, dict):
-            raise ValueError("设置必须是一个对象")
+            raise ValueError("settings must be an object")
         config = PushDiscoveryConfig(
             enabled=body.get("enabled") is True,
             watch_local=body.get("watch_local") is not False,
@@ -672,6 +704,14 @@ class ChannelState:
     running: bool = False
     message: str = ""
     roots: tuple[str, ...] = field(default_factory=tuple)
+    #: `message` 那一句的 code 与参数（ADR-0159）；`message` 是 zh-CN 原文。
+    message_code: str = ""
+    message_params: dict = field(default_factory=dict)
+
+    @classmethod
+    def stopped(cls, name: str, **params) -> "ChannelState":
+        code = f"labels.pushDiscovery.{name}"
+        return cls(False, interface_text.text(f"server:{code}", params), message_code=code, message_params=params)
 
 
 class PushDiscoveryService:
@@ -701,26 +741,73 @@ class PushDiscoveryService:
         self.config = self.settings.load(self.declared_roots)
         self.queue = DiscoveryQueue(
             self._ingest, self._probe, debounce=debounce, settle=settle,
-            journal=Path(state_root) / PENDING_FILENAME)
+            journal=Path(state_root) / PENDING_FILENAME, probe_many=self._probe_many)
         self.local_channel = ChannelState()
         self._observer = None
         self._lock = threading.Lock()
+        #: 后台起本地监视那一次的线程；`_generation` 在每次 `stop` 时加一，
+        #: 起完时代数已经变了，说明这一份监视没人要了。
+        self._opening: threading.Thread | None = None
+        self._generation = 0
+        self._local_lock = threading.Lock()
 
 
     # -- 出口：两条通道最后都走这里
 
-    def _local_path(self, location: str, path: str) -> Path:
+    def _local_directory(self, location: str, path: str):
+        """账本路径所在目录的本机形态（`Path` 或 SMB 目录）。"""
         from .scan import walk_root_for
-        ledger_dir = str(PureWindowsPath(path).parent)
-        directory = walk_root_for(
-            location, ledger_dir, declared_roots=self.declared_roots, mounts=self.mounts)
-        return directory / PureWindowsPath(path).name
+        return walk_root_for(location, str(PureWindowsPath(path).parent),
+                             declared_roots=self.declared_roots, mounts=self.mounts)
+
+    def _local_path(self, location: str, path: str) -> Path:
+        return self._local_directory(location, path) / PureWindowsPath(path).name
 
     def _probe(self, location: str, path: str) -> int | None:
+        """文件大小；明确不在回 None。读不了、超时照常抛 OSError，由队列过一会儿再测。
+
+        stat 放进可终止的子进程：挂死的网盘挂载只拖住这一条，队列线程到期就回来。
+        """
         try:
-            return self._local_path(location, path).stat().st_size
-        except (OSError, ValueError):
+            return media_io.file_stat(self._local_path(location, path)).st_size
+        except (FileNotFoundError, NotADirectoryError, ValueError):
             return None
+
+    def _probe_many(self, items: list[tuple[str, str]]) -> list:
+        """一轮到期的几条一起探：同一目录里有两条以上就列一次目录拿大小，其余逐条 stat。
+
+        每次读取都起一个子进程；整目录批量落地时逐条 stat 会让队列排上几十秒。
+        目录里按名字找不到的那条（大小写、Unicode 形态不一）再单独 stat 一次，不据此判它不在。
+        """
+        sizes: list = [None] * len(items)
+        groups: dict[str, tuple[object, list[tuple[int, str, str]]]] = {}
+        for index, (location, path) in enumerate(items):
+            try:
+                directory = self._local_directory(location, path)
+            except ValueError:
+                continue
+            groups.setdefault(str(directory), (directory, []))[1].append((index, location, path))
+        for directory, members in groups.values():
+            found = {}
+            if len(members) > 1:
+                try:
+                    found = {entry.name: entry for entry in media_io.directory_entries(directory)}
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                except OSError as error:
+                    for index, _location, _path in members:
+                        sizes[index] = error
+                    continue
+            for index, location, path in members:
+                entry = found.get(PureWindowsPath(path).name)
+                try:
+                    if entry is None:
+                        sizes[index] = self._probe(location, path)
+                    elif not entry.is_dir():
+                        sizes[index] = entry.stat().st_size
+                except OSError as error:
+                    sizes[index] = error
+        return sizes
 
     def _ingest(self, location: str, path: str, move_from=None, *, notify: bool = True) -> bool:
         from .record_rehome import reattach_in
@@ -770,7 +857,7 @@ class PushDiscoveryService:
         try:
             probe_path(self.db_path, str(choice.path) if choice else None, location, path)
         except sqlite3.Error:
-            LOGGER.exception("推送发现探测时长失败：%s", path)
+            LOGGER.exception("Push discovery duration probe failed: %s", path)
 
     def submit(self, location: str, path: str) -> bool:
         if ignored(path):
@@ -806,12 +893,12 @@ class PushDiscoveryService:
     def submit_cloud(self, cloud_path: str) -> str:
         """webhook 收到一条云端路径：映射成账本路径再进队列，返回那条账本路径。"""
         if not self.config.cloud:
-            raise CloudPathError("✗ 云端通道没有打开")
+            raise CloudPathError("errors.pushDiscovery.cloudChannelOff")
         path = map_cloud_path(cloud_path, self.config.prefixes)
         from .platform import resolve_location
         location = resolve_location(path, self.declared_roots)[0]
         if location is None:
-            raise CloudPathError(f"✗ {path} 不在任何媒体来源已配置的目录下")
+            raise CloudPathError("errors.pushDiscovery.notUnderStorage", {"path": path})
         self.submit(location, path)
         return path
 
@@ -834,7 +921,12 @@ class PushDiscoveryService:
                 import ctypes
                 if ctypes.windll.kernel32.GetDriveTypeW(str(Path(directory).anchor)) == 4:
                     continue
-            if directory.is_dir():
+            try:
+                online = media_io.root_online(directory)
+            except OSError:
+                # 挂死的挂载到期没答上：这一处先不监视，其余来源照常。
+                online = False
+            if online:
                 found.append(("local", root, directory))
         return found
 
@@ -853,55 +945,86 @@ class PushDiscoveryService:
             self.secret.ensure()
 
     def _start_local(self) -> None:
+        """本地监视在后台线程里起：判来源在线、`schedule` 与 `start` 都要碰来源目录，
+        挂死的挂载不能拖住服务启动与设置页保存。"""
         if not self.config.watch_local:
-            self.local_channel = ChannelState(False, "本地通道没有打开")
+            self.local_channel = ChannelState.stopped("localOff")
             return
+        with self._local_lock:
+            generation = self._generation
+        opening = threading.Thread(target=in_background(self._open_local), args=(generation,),
+                                   name="PeachPushDiscoveryWatch", daemon=True)
+        self._opening = opening
+        opening.start()
+
+    def _open_local(self, generation: int) -> None:
+        observer, state = self._watch()
+        with self._local_lock:
+            current = generation == self._generation
+            if current:
+                self._observer = observer
+                self.local_channel = state
+        if observer is not None and not current:
+            # 起到一半服务已经停了或换了设置：这一份没人要。
+            observer.stop()
+            observer.join(timeout=5)
+
+    def _watch(self):
+        """起本地监视，返回 `(observer 或 None, 通道状态)`。"""
         roots = self._local_roots()
         if not roots:
-            self.local_channel = ChannelState(False, "本地来源在这台机器上没有可监视的目录")
-            return
+            return None, ChannelState.stopped("noLocalRoots")
         try:
             from watchdog.observers import Observer
         except ImportError as error:  # 打包漏装时不该让整条服务起不来
-            self.local_channel = ChannelState(False, f"文件监视不可用：{error}")
-            return
+            return None, ChannelState.stopped("watchUnavailable", error=str(error))
         handler = _LocalEventHandler(self)
         observer = Observer()
-        for location, root, directory in roots:
-            handler.register(location, root, directory)
-            observer.schedule(handler, str(directory), recursive=True)
         try:
+            for location, root, directory in roots:
+                handler.register(location, root, directory)
+                observer.schedule(handler, str(directory), recursive=True)
             observer.start()
         except OSError as error:
-            self.local_channel = ChannelState(False, f"文件监视启动失败：{error}")
-            return
-        self._observer = observer
-        self.local_channel = ChannelState(
-            True, "", tuple(root for _location, root, _ in roots))
+            return None, ChannelState.stopped("watchFailed", error=str(error))
+        return observer, ChannelState(True, "", tuple(root for _location, root, _ in roots))
+
+    def wait_local(self, timeout: float) -> bool:
+        """等本地监视那一次起完（起来了或停在某个原因上），最多 `timeout` 秒；没在起返回真。"""
+        opening = self._opening
+        if opening is None:
+            return True
+        opening.join(timeout)
+        return not opening.is_alive()
 
     def stop(self) -> None:
-        observer, self._observer = self._observer, None
+        with self._local_lock:
+            self._generation += 1
+            observer, self._observer = self._observer, None
+            self.local_channel = ChannelState()
+        self._opening = None
         if observer is not None:
             observer.stop()
             observer.join(timeout=5)
-        self.local_channel = ChannelState()
         self.queue.stop()
 
     # -- 设置
 
     def save(self, body: dict) -> dict:
         if not self.available:
-            raise ValueError("推送发现只在允许修改数据库的设备上可用")
+            raise UserValueError("errors.pushDiscovery.writerOnly")
         with self._lock:
             self.config = self.settings.save(body, self.declared_roots)
             # 密钥由 `start` 补：云端通道一打开，CloudDrive2 那一侧马上要填，页面得当场给出来。
             self.stop()
             self.start()
+        # 来源正常时本地监视一眨眼就起好，回话里直接是新状态；卡住的挂载不等，页面下次读到。
+        self.wait_local(LOCAL_START_WAIT_SECONDS)
         return self.snapshot(reveal=True)
 
     def rotate_secret(self) -> dict:
         if not self.available:
-            raise ValueError("推送发现只在允许修改数据库的设备上可用")
+            raise UserValueError("errors.pushDiscovery.writerOnly")
         self.secret.rotate()
         return self.snapshot(reveal=True)
 
@@ -915,6 +1038,8 @@ class PushDiscoveryService:
             "endpoint": WEBHOOK_PATH,
             "local_running": self.local_channel.running,
             "local_message": self.local_channel.message,
+            "local_message_code": self.local_channel.message_code,
+            "local_message_params": self.local_channel.message_params,
             "local_roots": list(self.local_channel.roots),
             "queue": self.queue.snapshot(),
             "media_roots": [root for roots in self.declared_roots.values() for root in roots],

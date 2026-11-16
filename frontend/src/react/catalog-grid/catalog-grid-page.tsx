@@ -15,7 +15,7 @@ import { useInfiniteQuery, useQuery, type InfiniteData, type QueryKey } from '@t
 import { mixFace as mixArtwork, mixLabel, relayoutCovers, type Artwork } from '@peach/card-art';
 import { isOverlayPath, peachHistory } from '@peach/history';
 import { requestErrorMessage } from '@peach/legacy/core';
-import { LOAD_MORE_STATUS, loadingDotsHtml } from '@peach/legacy/ui';
+import { activityStatusHtml, LOAD_MORE_STATUS } from '@peach/legacy/ui';
 
 import { apiGet } from '../../api';
 import { PLAYBACK_PROGRESS_EVENT, type PlaybackProgress } from '../../player/telemetry';
@@ -319,7 +319,7 @@ export function LoadMore({ entity, load, enabled, children }: {
         ? <button ref={attach} type="button" data-entity-more="" {...aria} onClick={() => void run(true)}>{children ?? t('catalog:shared.loadMore')}</button>
         /* 失败时只留下面那条重试：哨兵收起但不卸下，重试接上之后照旧由它续页。 */
         : <div ref={attach} data-load-more="" {...aria} hidden={Boolean(state.error)} onClick={() => void run(true)}
-          dangerouslySetInnerHTML={{ __html: loadingDotsHtml(LOAD_MORE_STATUS) }} />}
+          dangerouslySetInnerHTML={{ __html: activityStatusHtml('linear-dots', LOAD_MORE_STATUS) }} />}
       {state.error ? <RetryNote message={state.error} onRetry={() => void run(true)} /> : null}
     </>
   );
@@ -333,8 +333,9 @@ function useShortsStrips(
   tiles: readonly Tile[], pageStarts: readonly number[], body: RefObject<HTMLElement | null>,
 ): ShortsCut[] {
   type Saved = { cuts: ShortsCut[]; offset: number; handled: number };
-  const cacheKey = ['catalog-short-layout', catalogParams(props.filters || {}, !!props.excludeVertical)];
-  const stamp = `${cacheKey[1]}:${props.revision}`;
+  const limit = props.shortsLimit || SHORTS_BATCH;
+  const cacheKey = ['catalog-short-layout', catalogParams(props.filters || {}, !!props.excludeVertical), limit];
+  const stamp = `${cacheKey[1]}:${limit}:${props.revision}`;
   const create = () => {
     const saved = props.restoreNavigation ? queryClient.getQueryData<Saved>(cacheKey) : undefined;
     const groups = { parts: new Set<string>(), editions: new Set<string>() };
@@ -361,7 +362,7 @@ function useShortsStrips(
     const controller = new AbortController();
     own.controllers.push(controller);
     const page = pages - 1;
-    apiGet<MediaPage>(`/api/items?${shortsParams(props.filters || {}, own.offset)}`, controller.signal)
+    apiGet<MediaPage>(`/api/items?${shortsParams(props.filters || {}, own.offset, limit)}`, controller.signal)
       .then((strip) => {
         if (run.current !== own || controller.signal.aborted) return;
         const items = strip.items || [];
@@ -383,7 +384,7 @@ function useShortsStrips(
     if (!boundaries.length) return;
     /* 落点定了才折叠：剪不出落点的这一批下次照原偏移量重取，不能先记成已出现。 */
     const items = collapseGroups(arrived.items, own.groups, props.groupCollapse !== false);
-    own.offset = arrived.more ? own.offset + SHORTS_BATCH : 0;
+    own.offset = arrived.more ? own.offset + limit : 0;
     if (!items.length) return;
     const at = start + (boundaries[Math.floor(Math.random() * boundaries.length)] ?? 0);
     const next = [...cuts, { at, total: arrived.total, items }];

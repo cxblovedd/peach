@@ -13,24 +13,36 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from . import follow_evidence, interface_text, system_file_repair
+from . import follow_evidence, interface_text, legacy_repairs, system_file_repair
 from .media_sources import CLOUD_LOCATIONS
 
 #: 列给用户看的修复：id 与是否自动执行，顺序就是页面顺序。标题与一句说明在
 #: `server:repairCenter.items.<id>`（ADR-0159），响应里同层的中文按 zh-CN 渲染。
 ITEMS = (
     ('catalog', 'auto'), ('display-local', 'auto'), ('display-cloud', 'confirm'), ('system-files', 'auto'),
+    ('sidecar-assets', 'auto'), ('avatar-faces', 'auto'),
     ('garbled-people', 'auto'), ('dangling-candidates', 'auto'), ('javdb-entries', 'auto'),
-    ('resolution-tags', 'auto'), ('follow-evidence', 'confirm'),
+    ('resolution-tags', 'auto'), ('video-medium', 'auto'), ('quality-bands', 'auto'), ('interface-text', 'auto'),
+    *((rule.item, 'auto') for rule in legacy_repairs.RULES), ('follow-evidence', 'confirm'),
+    *((rule.item, 'confirm') for rule in legacy_repairs.CONFIRMS),
 )
 #: 历史里的规则：账本行 id 的前缀、计哪个字段（`None` 为资料整理的改动合计）。
 #: 前缀去掉末尾的连字符就是规则 id，名字在 `server:repairCenter.history.<id>`。
 RULES = (
-    ('catalog-', None), ('verification-settlement-', ('applied',)),
+    ('catalog-', None), ('verification-settlement-', ('applied',)), ('performer-spacing-', ('applied',)),
+    ('enhancement-suffix-names-', ('aliases', 'terms', 'added_aliases')),
+    ('fc2-seller-backfill-', ('entity_ids',)),
+    ('code-sibling-identity-', ('links',)),
     ('studio-unbounded-misses-', ('released',)), ('stale-filename-codes-', ('cleared',)),
     ('dangling-candidates-', ('repinned', 'withdrawn')),
     ('javdb-actor-records-', ('hidden', 'disabled_feeds')),
     ('source-resolution-tags-', ('tags',)),
+    ('video-medium-', ('video',)),
+    ('sidecar-assets-', ('removed',)),
+    ('avatar-faces-', ('written',)),
+    ('quality-resolution-', ('assets',)),
+    ('interface-text-codes-', ('rows', 'attempts')),
+    *((rule.prefix, ('changed',)) for rule in (*legacy_repairs.RULES, *legacy_repairs.CONFIRMS)),
     (follow_evidence.RECEIPT_PREFIX, ('files',)),
 )
 #: 资料整理回执里不算「改动」的计数：重新探测、转人工与来源快照失效只是排队或让缓存重取，不是改了资料。
@@ -54,6 +66,12 @@ def _latest(rows, key):
         if key in result:
             return result[key]
     return None
+
+
+def _receipt_fact(rows, prefix: str, *fields: str) -> dict:
+    """按账本行 id 前缀取最新一次补修回执：有就是做完了，`changed` 为这几个字段的条数合计。"""
+    result = next((result for row_id, _, result in rows if row_id.startswith(prefix)), {})
+    return {'state': 'done' if result else 'none', 'changed': sum(_count(result.get(field)) for field in fields)}
 
 
 def _touched(fact: dict) -> bool:
@@ -149,8 +167,16 @@ def _display_cloud(pending: int, included: bool, done: int, total: int) -> dict:
             **({'done': done, 'total': total} if total else {})}
 
 
+def _confirmed(rows, prefix: str, pending: int) -> dict:
+    """等确认的存量修正：还有要改的就等确认（`pending` 是几处），没有了报上一次改了几处。"""
+    last = _receipt_fact(rows, prefix, 'changed')
+    if pending:
+        return {'state': 'waiting', 'pending': pending, 'changed': last['changed'], 'backed_up': True}
+    return last
+
+
 def snapshot(connection, receipt: dict, *, cloud_pending: int, backup_directories=(),
-             follow_evidence_status: dict | None = None) -> dict:
+             follow_evidence_status: dict | None = None, confirm_pending: dict | None = None) -> dict:
     rows = sorted(((row[0], float(row[1] or 0), json.loads(row[2] or '{}')) for row in connection.execute(
         'SELECT id, applied_at, result_json FROM ledger_upgrade_repair')), key=lambda row: row[1], reverse=True)
     local = receipt.get('local', {})
@@ -161,9 +187,6 @@ def snapshot(connection, receipt: dict, *, cloud_pending: int, backup_directorie
     included = bool(display.get('cloud_included_at'))
     isolated = _latest(rows, system_file_repair.RULE) or {}
     garbled = _latest(rows, 'garbled_people') or {}
-    dangling = next((result for row_id, _, result in rows if row_id.startswith('dangling-candidates-')), {})
-    javdb_entries = next((result for row_id, _, result in rows if row_id.startswith('javdb-actor-records-')), {})
-    resolution = next((result for row_id, _, result in rows if row_id.startswith('source-resolution-tags-')), {})
     facts = {
         'catalog': {'state': local.get('state') or ('done' if local else 'none'),
                     'changed': _count({key: value for key, value in local.get('changed', {}).items()
@@ -173,12 +196,18 @@ def snapshot(connection, receipt: dict, *, cloud_pending: int, backup_directorie
         'display-cloud': _display_cloud(cloud_pending, included, cloud_done, cloud_total),
         'system-files': {'state': 'done' if isolated else 'none', 'changed': _count(isolated.get('isolated'))},
         'garbled-people': {'state': 'done' if garbled else 'none', 'changed': _count(garbled.get('links'))},
-        'dangling-candidates': {'state': 'done' if dangling else 'none',
-                                'changed': _count(dangling.get('repinned')) + _count(dangling.get('withdrawn'))},
-        'javdb-entries': {'state': 'done' if javdb_entries else 'none',
-                          'changed': _count(javdb_entries.get('hidden')) + _count(javdb_entries.get('disabled_feeds'))},
-        'resolution-tags': {'state': 'done' if resolution else 'none', 'changed': _count(resolution.get('tags'))},
+        'dangling-candidates': _receipt_fact(rows, 'dangling-candidates-', 'repinned', 'withdrawn'),
+        'javdb-entries': _receipt_fact(rows, 'javdb-actor-records-', 'hidden', 'disabled_feeds'),
+        'resolution-tags': _receipt_fact(rows, 'source-resolution-tags-', 'tags'),
+        'quality-bands': _receipt_fact(rows, 'quality-resolution-', 'assets'),
+        'video-medium': _receipt_fact(rows, 'video-medium-', 'video'),
+        'sidecar-assets': _receipt_fact(rows, 'sidecar-assets-', 'removed'),
+        'avatar-faces': _receipt_fact(rows, 'avatar-faces-', 'written'),
+        'interface-text': _receipt_fact(rows, 'interface-text-codes-', 'rows', 'attempts'),
         'follow-evidence': _follow_evidence(follow_evidence_status, rows),
+        **{rule.item: _receipt_fact(rows, rule.prefix, 'changed') for rule in legacy_repairs.RULES},
+        **{rule.item: _confirmed(rows, rule.prefix, (confirm_pending or {}).get(rule.item, 0))
+           for rule in legacy_repairs.CONFIRMS},
     }
     items = [{'id': key, 'title': interface_text.text(f'server:repairCenter.items.{key}.title'),
               'summary': interface_text.text(f'server:repairCenter.items.{key}.summary'), 'mode': mode, **facts[key]}

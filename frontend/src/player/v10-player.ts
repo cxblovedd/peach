@@ -2,6 +2,10 @@
 import { randomId } from '../core/random-id';
 import type { PlayerEvents, PlayerSource, QualityLevelList, VideojsFactory, VjsPlayer } from './types';
 import { interfaceLanguage, t } from '../i18n';
+import { mountPlayerFullscreen } from './fullscreen';
+import { mountVolumeMemory } from './volume-memory';
+import { mountAutoFullscreen } from './auto-fullscreen';
+import { wirePlayerInteractions } from './touch-controls';
 
 interface HlsEngine {
   bandwidthEstimate: number;
@@ -59,30 +63,25 @@ export const createV10Player: VideojsFactory = (video, options) => {
   const cleanup = new AbortController();
   const signal = cleanup.signal;
   let disposed = false, sourceGeneration = 0, playGeneration = 0, expectedDuration = 0, source: PlayerSource = { src: '', type: '' }, failure: unknown = null;
-  let idle: ReturnType<typeof setTimeout> | undefined;
-  const active = () => {
-    root.classList.add('vjs-user-active'); root.classList.remove('vjs-user-inactive');
-    if (idle) clearTimeout(idle);
-    if (!video.paused) idle = setTimeout(() => {
-      if (root.matches(':focus-within,:hover') && root.querySelector('[aria-expanded="true"]')) return;
-      root.classList.remove('vjs-user-active'); root.classList.add('vjs-user-inactive');
-    }, 2500);
-  };
-  root.addEventListener('pointermove', active, { signal });
-  root.addEventListener('focusin', active, { signal });
-  video.addEventListener('click', () => { if (video.paused) void video.play().catch(() => {}); else video.pause() }, { signal });
-  video.addEventListener('dblclick', () => root.querySelector<HTMLElement>('media-fullscreen-button')?.click(), { signal });
+  const { active, cancel } = wirePlayerInteractions(root, video, signal, () => expectedDuration || video.duration, options.controls !== false);
   const update = () => {
     root.classList.toggle('vjs-paused', video.paused); root.classList.toggle('vjs-playing', !video.paused);
     root.classList.toggle('vjs-ended', video.ended); root.classList.toggle('vjs-has-started', video.currentTime > 0 || !video.paused);
     active();
   };
   const emit = (name: string) => events.dispatchEvent(new Event(name));
+  // 进入等待时的播放位置：之后时间往前走了，就说明已经在播。
+  let waitingAt = -1;
   for (const name of ['play', 'pause', 'ended', 'loadedmetadata', 'durationchange', 'timeupdate', 'progress', 'loadstart', 'waiting', 'stalled', 'canplay', 'playing', 'seeking', 'seeked', 'ratechange', 'volumechange', 'resize', 'enterpictureinpicture', 'leavepictureinpicture']) {
     video.addEventListener(name, () => {
       if (['play', 'pause', 'ended', 'loadedmetadata'].includes(name)) update();
-      if (['waiting', 'stalled', 'seeking'].includes(name)) root.classList.add('vjs-waiting');
+      // stalled 只说明暂时没收到数据；缓冲还够（HAVE_FUTURE_DATA 及以上）时照常在播，不算等待。
+      if (['waiting', 'seeking'].includes(name) || (name === 'stalled' && video.readyState < 3)) {
+        root.classList.add('vjs-waiting'); waitingAt = video.currentTime;
+      }
       if (['canplay', 'playing', 'seeked', 'pause'].includes(name)) root.classList.remove('vjs-waiting');
+      // iOS Safari 渐进下载时会发 stalled、waiting，缓冲够了接着播却不再发 canplay、playing：时间在走就清掉。
+      if (name === 'timeupdate' && !video.seeking && video.currentTime !== waitingAt) root.classList.remove('vjs-waiting');
       emit(name);
     }, { signal });
   }
@@ -93,10 +92,9 @@ export const createV10Player: VideojsFactory = (video, options) => {
     if (notify) emit('error');
   };
   media.addEventListener('error', () => showError(media.error || video.error), { signal });
-  document.addEventListener('fullscreenchange', () => {
-    root.classList.toggle('vjs-fullscreen', !!document.fullscreenElement && root.contains(document.fullscreenElement));
-    emit('fullscreenchange');
-  }, { signal });
+  const isFullscreen = mountPlayerFullscreen(root, video, () => emit('fullscreenchange'), signal);
+  mountVolumeMemory(video, signal);
+  mountAutoFullscreen(root, video, isFullscreen, signal);
   const levels = [] as unknown as QualityLevelList;
   const boundEngines = new WeakSet<HlsEngine>();
   let enabledLevels: boolean[] = [], selectionQueued = false;
@@ -143,7 +141,7 @@ export const createV10Player: VideojsFactory = (video, options) => {
     isDisposed: () => disposed,
     dispose: () => {
       if (disposed) return;
-      emit('dispose'); disposed = true; cleanup.abort(); if (idle) clearTimeout(idle);
+      emit('dispose'); disposed = true; cleanup.abort();
       media.adapter.destroy(); video.pause(); video.removeAttribute('src'); video.load(); root.remove();
     },
     trigger: emit,
@@ -162,9 +160,10 @@ export const createV10Player: VideojsFactory = (video, options) => {
     playbackRate: (value?: number) => value === undefined ? video.playbackRate : (video.playbackRate = value),
     loop: (value?: boolean) => value === undefined ? video.loop : (video.loop = value),
     muted: () => video.muted, volume: () => video.volume,
-    isFullscreen: () => !!document.fullscreenElement && root.contains(document.fullscreenElement),
+    isFullscreen,
     poster: (url: string) => { video.poster = url },
     src: (next: PlayerSource) => {
+      cancel();
       source = next; failure = null; root.classList.remove('vjs-error');
       sourceGeneration++; playGeneration++; selectionQueued = false; enabledLevels = []; levels.length = 0;
       const tag = next.type.toLowerCase().includes('dash') ? 'dash-video' : 'hlsjs-video';

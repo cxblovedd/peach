@@ -10,6 +10,9 @@ PROVIDER_EVIDENCE = 2
 #: 文字补修规则。4：刮削挂上的乱码人物关联自动解除并重采（#478）；已有旧回执的库只重跑文字补修。
 PROVIDER_TEXT = 4
 OFFICIAL_COVER_CATALOG_MISSES = 1
+#: 文件名番号判据放宽后（如 TMA 的 `T28-612`），账本里还没番号、按现行规则认得出的影片撤掉处理检查点重新处理。
+#: 判据又放宽时加一。
+FILENAME_CODES = 1
 #: 核查差异按确定判据结算（ADR-0139）。判据改了就加一，升级时对存量候选再结算一遍。
 VERIFICATION_SETTLEMENT = 1
 # 旧队列保持撤下状态；新规则单独记录已取得的 SAR 测量。
@@ -21,3 +24,9 @@ DANGLING_CANDIDATES = 1
 JAVDB_ACTOR_RECORDS = 1
 #: 刮削按来源 genre 挂上的分辨率标签（`4K` 等说的是官方发行版本）解除。判据改了就加一，升级时再对存量做一遍。
 SOURCE_RESOLUTION_TAGS = 1
+#: 按现行扩展名规则是视频、账本里还记成 other 的行改成视频（#551 的 WebM）。判据改了就加一，升级时再对存量做一遍。
+VIDEO_MEDIUM = 1
+#: 旧任务行与补全记录里的界面文字转成 code（ADR-0159 第五条）。模板措辞改了就加一，升级时按新措辞再认一遍。
+INTERFACE_TEXT_CODES = 1
+#: 旧扫描登记成作品的 NFO、海报、剧照与截图缩略图从账本删行（`sidecar_asset_repair`）。判据改了就加一，升级时再对存量做一遍。
+SIDECAR_ASSETS = 1

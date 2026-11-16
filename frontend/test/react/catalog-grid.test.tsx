@@ -107,7 +107,7 @@ describe('目录取数', () => {
 
   it('竖屏带跟着主列表的筛选走，一条取一批竖屏', () => {
     const params = new URLSearchParams(shortsParams({ sort: 'seed', tag: '' }, 36));
-    expect(Object.fromEntries(params)).toEqual({ sort: 'seed', orient: '竖屏', limit: String(SHORTS_BATCH), offset: '36' });
+    expect(Object.fromEntries(params)).toEqual({ sort: 'seed', orient: 'portrait', limit: String(SHORTS_BATCH), offset: '36' });
   });
 });
 
@@ -245,7 +245,7 @@ describe('续页', () => {
       if (init?.method === 'POST') posts.push(JSON.parse(String(init.body)));
       const url = new URL(String(input), 'http://peach.test');
       const body = url.pathname === '/api/library-processing' ? { status: 'idle' }
-        : url.searchParams.get('orient') === '竖屏' ? { items: strip, total: strip.length, has_more: false }
+        : url.searchParams.get('orient') === 'portrait' ? { items: strip, total: strip.length, has_more: false }
           : { items: [1, 2, 3].map((n) => item(n)), total: 3, has_more: false };
       return Promise.resolve(reply(body));
     }));
@@ -260,13 +260,46 @@ describe('续页', () => {
     queryClient.removeQueries({ queryKey: ['catalog-grid'] });
   });
 
+  it('竖屏带一条按设置的张数取，下一条从这一条之后接着取；不插带子时不发竖屏请求', async () => {
+    vi.stubGlobal('IntersectionObserver', FakeObserver);
+    const strips: URLSearchParams[] = [];
+    vi.stubGlobal('fetch', vi.fn((input: string) => {
+      const url = new URL(String(input), 'http://peach.test');
+      if (url.searchParams.get('orient') === 'portrait') strips.push(url.searchParams);
+      const offset = Number(url.searchParams.get('offset') || 0);
+      const body = url.pathname === '/api/library-processing' ? { status: 'idle' }
+        : url.searchParams.get('orient') === 'portrait'
+          ? { items: [1, 2].map((n) => item(500 + offset + n)), total: 40, has_more: true }
+          : { items: [1, 2, 3].map((n) => item(offset + n)), total: 9, has_more: offset + 3 < 9 };
+      return Promise.resolve(reply(body));
+    }));
+    const host = await mount(<QueryClientProvider client={queryClient}>
+      <CatalogGridPage {...props({ sort: 'seed', q: '竖屏带张数' })} shorts shortsLimit={6} />
+    </QueryClientProvider>);
+    await until(() => strips.length > 0, '竖屏带请求');
+    expect([strips[0]!.get('limit'), strips[0]!.get('offset')]).toEqual(['6', '0']);
+    await until(() => !!host.querySelector('[data-shorts-strip]'), '竖屏带插进网格');
+    await FakeObserver.latest().near();
+    await until(() => strips.length > 1, '下一页带出第二条竖屏带');
+    expect([strips[1]!.get('limit'), strips[1]!.get('offset')]).toEqual(['6', '6']);
+    queryClient.removeQueries({ queryKey: ['catalog-grid'] });
+    document.body.innerHTML = '';
+    strips.length = 0;
+    await mount(<QueryClientProvider client={queryClient}>
+      <CatalogGridPage {...props({ sort: 'seed', q: '不插竖屏带' })} shorts={false} />
+    </QueryClientProvider>);
+    await until(() => !!document.querySelector('[data-media-card]'), '主网格画出');
+    expect(strips).toEqual([]);
+    queryClient.removeQueries({ queryKey: ['catalog-grid'] });
+  });
+
   it('竖屏带与主网格同一个「合并分卷与版本」：开着一组分卷只出一张整组卡，关着各卷各自成卡、不标卷数', async () => {
     vi.stubGlobal('IntersectionObserver', FakeObserver);
     const group = { key: 'FC2-PPV-3189161', seed_id: 41, count: 2, title: 'FC2-PPV-3189161', total_duration: 1200 };
     const strip = [item(41, { part_group: group, duration: 600 }), item(43), item(42, { part_group: group, duration: 600 })];
     vi.stubGlobal('fetch', vi.fn((input: string) => {
       const url = new URL(String(input), 'http://peach.test');
-      const body = url.searchParams.get('orient') === '竖屏'
+      const body = url.searchParams.get('orient') === 'portrait'
         ? { items: strip, total: strip.length, has_more: false }
         : { items: [1, 2, 3].map((n) => item(n)), total: 3, has_more: false };
       return Promise.resolve(reply(body));
@@ -309,7 +342,7 @@ describe('续页', () => {
     vi.stubGlobal('IntersectionObserver', FakeObserver);
     vi.stubGlobal('fetch', vi.fn((input: string) => {
       const url = new URL(String(input), 'http://peach.test');
-      const body = url.searchParams.get('orient') === '竖屏'
+      const body = url.searchParams.get('orient') === 'portrait'
         ? { items: portraitParts, total: portraitParts.length, has_more: false }
         : { items: [1, 2, 3].map((n) => item(n)), total: 3, has_more: false };
       return Promise.resolve(reply(body));
@@ -579,7 +612,7 @@ describe('作品卡', () => {
   });
 
   it('有图却取失败时不留坏图：问服务端卡在哪一步，缺印相的本地影片给「补全预览」', async () => {
-    vi.stubGlobal('fetch', fetchMock(404, { error: 'unavailable', reason: 'snapshot unavailable' }));
+    vi.stubGlobal('fetch', fetchMock(404, { error: 'unavailable', reason: 'snapshot unavailable', reason_code: 'errors.previews.snapshotUnavailable' }));
     const { host } = await render(item(31, { location: 'local', has_thumb: true }));
     const img = host.querySelector('[data-media-art] img')!;
     await act(async () => { img.dispatchEvent(new Event('error')) });
@@ -591,7 +624,7 @@ describe('作品卡', () => {
   });
 
   it('取失败后「重试」换一个地址重新取图', async () => {
-    vi.stubGlobal('fetch', fetchMock(404, { error: 'unavailable', reason: 'ffmpeg generation failed' }));
+    vi.stubGlobal('fetch', fetchMock(404, { error: 'unavailable', reason: 'ffmpeg generation failed', reason_code: 'errors.previews.ffmpegFailed' }));
     const { host } = await render(item(32, { location: '115', has_thumb: true }));
     await act(async () => { host.querySelector('[data-media-art] img')!.dispatchEvent(new Event('error')) });
     await settle();

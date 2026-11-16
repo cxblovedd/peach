@@ -1,5 +1,6 @@
 /* layout 域控制器：本域状态与动作，启动由 Application 的生命周期统一安装。 */
-import { javCardPage } from '../jav-controls';
+import { javCardPage, javSelectPage } from '../jav-controls';
+import { pageSelectPath } from '../react/components/page-selection';
 import { DIRECT_MANAGE_NAV, MANAGE_MENU_SECTIONS, MANAGE_SECTIONS, NAV_CATALOG, OPTIONAL_SIDEBAR_ITEMS, SIDEBAR_ITEMS, getManageMenuSections } from './navigation-items';
 import { FOLLOW_INITIAL_RANGE_OPTIONS } from './initial-follow-ranges';
 import { noteHtml, revealTexts } from '../ui-kit';
@@ -12,6 +13,7 @@ import { hideDiscoveryBars } from './loading.js';
 import { releaseManagedRoute } from './../history/managed';
 import { isFeedNewPath } from './feed.js';
 import { tagLabel } from '../core/tags';
+import { PORTRAIT } from '../core/stored-values';
 import { followFeedLive, followState, followView, followViewPath, routeFollowFeed } from './follow.js';
 import { applicationEffects } from './effects';
 import { entityJavLayout, notifyShell, pageOpens, runtimeConfigurable, selectMode, selectSurface, state, writeShell } from './../shell/index';
@@ -360,14 +362,14 @@ export function navOn(k){
   }
   // JAV 分区及馆藏 JAV 筛选共用导航状态；竖屏由内存里的筛选开关判定。
   if(k==='jav')return path==='/jav'||javActive();
-  if(k==='shorts')return state.orient==='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='shorts')return state.orient===PORTRAIT;
   // 首页只在真的停在首页列表上时亮：管理区、索引页、实体页都不算，
   // 否则它会和当前所在的入口同时高亮。
-  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='')return path==='/'&&!manageSection()&&!state.state&&!javActive()&&state.orient!==PORTRAIT;
   // 目录页的四个筛选态共用一屏，竖屏是压在它们之上的另一层筛选。
-  if(STATE_ROUTES[k])return nav===k&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  if(STATE_ROUTES[k])return nav===k&&state.orient!==PORTRAIT;
   if(nav)return nav===k;
-  return path==='/'&&state.state===k&&state.orient!=='竖屏'; // i18n-exempt: 竖屏是地址参数与状态值
+  return path==='/'&&state.state===k&&state.orient!==PORTRAIT;
 }
 
 export function navTo(k){
@@ -386,21 +388,34 @@ export function navTo(k){
   // 有自己路径的入口（追更、播放列表、沉浸模式、索引页）按路由元数据的 `nav` 找路径进。
   const path=STATE_ROUTES[k]?null:navigationState.routePathOf('nav',k);
   if(path){navigationState.openRoutePath(path);return}
-  if(k==='shorts'){state.orient='竖屏';state.state=''}else{state.orient='';state.state=k} // i18n-exempt: 竖屏是地址参数与状态值
+  if(k==='shorts'){state.orient=PORTRAIT;state.state=''}else{state.orient='';state.state=k}
   notifyShell();
   navigationState.route(homePath());
   syncNavigation();buildBars();
 }
+
+/** 本地名册五页：进了多选模式才显示勾选与批量键。 */
+const ROSTER_PATHS=new Set(['/performers','/creators','/studios','/agencies','/series']);
 
 export function syncHeaderActions(){
   const path=decodeURIComponent(location.pathname),parts=path.split('/').filter(Boolean);
   if(selectMode&&selectSurface!==selectionState.currentSelectSurface())
     setSelectMode(false,true);
   const entity=parts.length>1&&Object.prototype.hasOwnProperty.call(ROUTE_ENTITIES,parts[0]);
+  const query=new URLSearchParams(location.search);
+  /* 实体页此刻画的是哪一档：画过以后以页面报的为准，首屏之前按地址里的 `media` 推。 */
+  const media=query.get('media')||'';
+  const entityView=entity?(entityState.entityPageView||(media==='photos'||media==='online'?media:'videos')):'';
   const catalog=isCatalogPath(path)||path==='/trash';
   const javCards=javCardPage(path,location.search);
-  if(path==='/jav'&&selectMode)setSelectMode(false,true);
-  const canSelect=catalog||entity||path==='/tags'||path==='/follow'||javCards;
+  if((path==='/jav'||pageSelectPath(path))&&selectMode)setSelectMode(false,true);
+  /* 标签页两种范围都能多选：本地拼目录筛选，在线做隐藏与屏蔽。本地名册做批量动作，艺人页的在线那档不在内。 */
+  const tagsSelectable=path==='/tags';
+  const rosterSelectable=ROSTER_PATHS.has(path)&&!(path==='/performers'&&query.get('scope')==='online');
+  /* 处理队列页（重复文件、复核、高清升级、关注管理、数据管理里的表格）的选择集归页面，右上角开关同样能用。
+     实体页四种视图（名册、视频、照片、在线）都有可选的条目。 */
+  const canSelect=catalog||['people','videos','photos','online'].includes(entityView)||tagsSelectable||rosterSelectable||path==='/follow'
+    ||javSelectPage(path,location.search)||pageSelectPath(path);
   const canDensity=catalog||entity||path==='/follow'||javCards;
   $('#selectMode').hidden=!canSelect;$('#density').hidden=!canDensity;
   syncPhotoWalls();

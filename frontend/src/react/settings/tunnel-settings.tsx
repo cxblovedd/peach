@@ -18,10 +18,14 @@ import { SEGMENT, SEGMENTED_TRACK, SegmentedRadioGroup as RadioGroup } from '../
 import { CONFIGURATION_KEY, fetchConfiguration } from './configuration';
 import { ExternalLink, ErrorText, Footer, Help, Section, Stack } from './section';
 import { busyProps, useAction } from './use-action';
+import { bodyFieldErrors, codedText } from '../../core/server-text';
+import { pollUntil } from '../../polling';
 import { t } from '../../i18n';
 
-/** 连接握手在服务端进行，页面按固定间隔重问，直到拿到入口或失败原因。 */
+/** 连接握手在服务端进行，页面按固定间隔重问，直到拿到入口或失败原因；读失败退避，页面不可见时暂停。 */
 const POLL_INTERVAL = 2000;
+/** 握手最多等这么久，过了由用户重新打开。 */
+const POLL_LIMIT_MS = 5 * 60_000;
 
 const MODES: [TunnelState['mode'], string][] = [['quick', t('settings:cloudflareTunnel.quick')], ['named', t('settings:cloudflareTunnel.named')]];
 
@@ -32,12 +36,17 @@ const HELP: Record<TunnelState['mode'], string> = {
 
 type FieldErrors = Partial<Record<'hostname' | 'mode', string>>;
 
-export function TunnelSettings({ revision: initialRevision, initial, receipt }: {
+export function TunnelSettings({ revision: initialRevision, initial, receipt, blocked = false }: {
   revision: string;
   initial: TunnelState;
   receipt(message: string): void;
+  /** 没设访问密码（或被锁定）：服务端拒绝启动，这里不让按、不让填；关掉密码时服务端已停掉隧道。 */
+  blocked?: boolean;
 }) {
   const [state, setState] = useState(initial);
+  useEffect(() => {
+    if (blocked) setState((current) => current.state === 'stopped' ? current : { ...current, enabled: false, state: 'stopped', url: '' });
+  }, [blocked]);
   const [revision, setRevision] = useState(initialRevision);
   const [mode, setMode] = useState<TunnelState['mode']>(initial.mode);
   const [hostname, setHostname] = useState(initial.hostname);
@@ -50,21 +59,19 @@ export function TunnelSettings({ revision: initialRevision, initial, receipt }: 
   useEffect(() => {
     if (state.state !== 'starting') return undefined;
     const controller = new AbortController();
-    const timer = window.setInterval(() => {
-      void fetchConfiguration(controller.signal)
-        .then((next: ConfigurationData) => {
-          if (controller.signal.aborted || !next.tunnel) return;
-          // 取回来的是整份配置，换进整页那一个键：屏幕上只有一份真相。
-          queryClient.setQueryData(CONFIGURATION_KEY, next);
-          setState(next.tunnel);
-          setRevision(next.revision);
-        })
-        .catch(() => undefined);
-    }, POLL_INTERVAL);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
+    void pollUntil<ConfigurationData>({
+      signal: controller.signal, everyMs: POLL_INTERVAL, limitMs: POLL_LIMIT_MS,
+      read: (signal) => fetchConfiguration(signal),
+      apply: (next) => {
+        if (!next.tunnel) return;
+        // 取回来的是整份配置，换进整页那一个键：屏幕上只有一份真相。
+        queryClient.setQueryData(CONFIGURATION_KEY, next);
+        setState(next.tunnel);
+        setRevision(next.revision);
+      },
+      done: (next) => !!next.tunnel && next.tunnel.state !== 'starting',
+    });
+    return () => controller.abort();
   }, [state.state]);
 
   /** 开关和保存走同一个端点：形态与开关状态一次提交，服务端据此构造启动计划。 */
@@ -82,9 +89,8 @@ export function TunnelSettings({ revision: initialRevision, initial, receipt }: 
       setToken('');
       done(next);
     }, (cause) => {
-      const payload = cause instanceof ApiError
-        ? cause.body as { errors?: FieldErrors; detail?: { errors?: FieldErrors } } : null;
-      const errors = payload?.errors || payload?.detail?.errors;
+      const payload = cause instanceof ApiError ? cause.body as { detail?: unknown } : null;
+      const errors = bodyFieldErrors<FieldErrors>(payload) || bodyFieldErrors<FieldErrors>(payload?.detail);
       if (errors) setFields(errors); else action.setError(errorMessage(cause));
     });
   };
@@ -103,7 +109,7 @@ export function TunnelSettings({ revision: initialRevision, initial, receipt }: 
       {state.error ? t('settings:cloudflareTunnel.connectionFailed') : state.state === 'running' ? t('settings:shared.running') : state.state === 'starting' ? t('settings:cloudflareTunnel.connectingStatus') : t('settings:shared.stopped')}</StatusLabel>}>
       <Stack>
         {state.named_available
-          ? <RadioGroup aria-label={t('settings:cloudflareTunnel.modeLabel')} value={mode} isDisabled={active}
+          ? <RadioGroup aria-label={t('settings:cloudflareTunnel.modeLabel')} value={mode} isDisabled={active || blocked}
               onChange={(next) => setMode(next as TunnelState['mode'])} className={SEGMENTED_TRACK}>
               {MODES.map(([value, label]) => (
                 <Radio key={value} value={value} className={SEGMENT}>{label}</Radio>
@@ -113,11 +119,11 @@ export function TunnelSettings({ revision: initialRevision, initial, receipt }: 
         <Help>{HELP[named ? 'named' : 'quick']}</Help>
         {named ? <>
           <Input id="tunnel-hostname" label={t('settings:remoteAccess.hostname')} autoComplete="off" maxLength={253}
-            value={hostname} onChange={setHostname} isDisabled={active} validationBehavior="aria"
+            value={hostname} onChange={setHostname} isDisabled={active || blocked} validationBehavior="aria"
             isInvalid={Boolean(fields.hostname)}
             hint={fields.hostname || t('settings:remoteAccess.hostnameHelp')} />
           <Input id="tunnel-token" type="password" label={t('settings:remoteAccess.tunnelToken')} autoComplete="off" maxLength={2048}
-            value={token} onChange={setToken} isDisabled={active} validationBehavior="aria"
+            value={token} onChange={setToken} isDisabled={active || blocked} validationBehavior="aria"
             hint={state.token_set
               ? t('settings:cloudflareTunnel.tokenSaved')
               : t('settings:cloudflareTunnel.tokenHint')} />
@@ -129,11 +135,12 @@ export function TunnelSettings({ revision: initialRevision, initial, receipt }: 
           ? <Note tone="info" title={t('settings:cloudflareTunnel.publicUrl')}><ExternalLink href={state.url}>{state.url}</ExternalLink></Note>
           : null}
         {state.state === 'starting' ? <Note tone="info" title={t('settings:cloudflareTunnel.connectingTitle')}>{t('settings:cloudflareTunnel.connectingHelp')}</Note> : null}
-        {state.error ? <ErrorText>{state.error}</ErrorText> : null}
+        {state.error ? <ErrorText>{codedText(state, 'error')}</ErrorText> : null}
         {action.error ? <ErrorText>{action.error}</ErrorText> : null}
       </Stack>
       <Footer>
-        <Button variant={state.named_available ? 'secondary' : 'primary'} onClick={toggle} {...busyProps(action.busy === 'toggle')}>
+        <Button variant={state.named_available ? 'secondary' : 'primary'} onClick={toggle} {...busyProps(action.busy === 'toggle')}
+          disabled={blocked && !active}>
           {active ? t('settings:cloudflareTunnel.stop') : t('settings:remoteAccess.start')}
         </Button>
         {state.named_available

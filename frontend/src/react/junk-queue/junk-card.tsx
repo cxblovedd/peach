@@ -16,8 +16,10 @@ import {
   junkDecision, junkKindMeta,
   type JunkItem, type JunkOperation, type JunkQueueActions, type JunkQueueHelpers, type JunkView,
 } from './junk-queue';
+import { Checkbox } from '@/components/base/checkbox/checkbox';
 import { suppressShiftTextSelection } from '../components/row-click';
 import { t } from '../../i18n';
+import { partsLabel } from '../../core/server-text';
 
 /** 雪碧图里的一枚字形，写法同遗留层 `icon()`：尺寸与描边由样式表按位置给。 */
 function Icon({ name }: { name: string }) {
@@ -103,10 +105,15 @@ function JunkCardView({ item, view, selected, selectMode, helpers, actions }: Ju
         <span data-media-check=""><Icon name="check" /></span>
       </div>
       <div data-junk-meta="">
+        {/* 勾选框常驻：点它只切换这一张，不冒泡到卡片那层的多选切换。 */}
+        <span data-junk-pick="" onClick={(event) => event.stopPropagation()}>
+          <Checkbox slot={null} size="sm" aria-label={t('cleanup:junk.selectFile', { name: name || t('cleanup:junk.untitled') })}
+            isSelected={selected} onChange={() => actions.toggleSelection(item.id, false)} />
+        </span>
         {title}
         <div data-junk-facts="">
           <span data-junk-who="">{label}</span>
-          {item.why ? <span data-junk-why="">{item.why}</span> : null}
+          {item.why ? <span data-junk-why="">{partsLabel(item.why_parts, item.why)}</span> : null}
           <span data-junk-size="">{Number(item.size) > 0 ? fmtSize(Number(item.size)) : t('cleanup:junk.unknownSize')}</span>
         </div>
       </div>

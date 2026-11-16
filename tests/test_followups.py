@@ -12,6 +12,7 @@ from unittest import mock
 from peach import followups as followups_module
 from peach import seed_followup, seed_pack, seed_validation
 from peach import task_runs as task_runs_module
+from peach.task_outcomes import codes
 from peach.avatar_followup import TASK_KEY as AVATAR_TASK_KEY
 from peach.avatar_followup import followup_key, parse_key, plan
 from peach.followups import FollowupRunner, FollowupType, lanes
@@ -22,6 +23,7 @@ from peach.repository import LedgerDatabase
 from peach.task_runs import MAX_FOLLOWUPS, TaskRunStore
 from support.conditions import windows_ledger_roots, without_capacity_reserve
 from support.ledger import fresh_ledger
+from support.outcomes import told
 
 
 def setUpModule():
@@ -161,6 +163,42 @@ class RunnerTests(LedgerTestCase):
             self.assertEqual(connection.execute("SELECT count(*) FROM task_run WHERE task_key=? "
                                                 "AND status='succeeded'", (AVATAR_TASK_KEY,)).fetchone()[0], 20)
 
+    def test_failed_followups_older_than_the_retention_window_are_pruned_with_their_controls(self):
+        from datetime import datetime, timedelta, timezone
+        from peach import update_tasks
+        parent = self.parent()
+        rows = self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i))
+                                                       for i in range(3)])['queued']
+        for run_id in rows[:2]:
+            self.store.finish(run_id, 'failed', error='source unavailable')
+        self.store.finish(parent.id, 'succeeded')
+        old = task_runs_module.stamp(datetime.now(timezone.utc)
+                                     - timedelta(days=task_runs_module.FAILED_FOLLOWUP_DAYS + 1))
+        with self.database.write_transaction() as connection:
+            connection.execute('UPDATE task_run SET finished_at=? WHERE id=?', (old, rows[0]))
+        controls = update_tasks.state_for(self.db).parent / 'task-controls'
+        self.assertTrue((controls / f'{rows[0]}.speed.json').exists())
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 1)
+        self.assertIsNone(self.store.get(rows[0]))
+        self.assertEqual(self.store.get(rows[1]).status, 'failed')
+        self.assertFalse((controls / f'{rows[0]}.speed.json').exists())
+        self.assertTrue((controls / f'{rows[1]}.speed.json').exists())
+
+    def test_a_type_that_settles_its_own_failures_keeps_them_past_the_window(self):
+        parent = self.parent()
+        rows = self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i))
+                                                       for i in range(2)])['queued']
+        self.store.finish(rows[0], 'failed', error='source unavailable')
+        self.store.finish(parent.id, 'succeeded')
+        with self.database.write_transaction() as connection:
+            connection.execute("UPDATE task_run SET finished_at='2000-01-01T00:00:00.000Z' WHERE id=?", (rows[0],))
+        owner = FollowupType(task_key=AVATAR_TASK_KEY, label='', writes_ledger=True,
+                             run=lambda contract, key, handle: {}, prunes_failures=True)
+        with registered(owner):
+            self.assertEqual(FollowupRunner(self.contract()).drain(), 1)
+        self.assertEqual(self.store.get(rows[0]).status, 'failed')
+
     def test_finished_followups_obey_retention_after_their_parent_settles(self):
         parent = self.parent()
         self.store.enqueue_followups(parent.id, [(f'avatar:{i}', AVATAR_TASK_KEY, str(i)) for i in range(21)])
@@ -183,7 +221,7 @@ class RunnerTests(LedgerTestCase):
             self.assertEqual(FollowupRunner(self.contract()).drain(), 1)
         done = self.store.get(queued[0])
         self.assertEqual(done.status, "succeeded")
-        self.assertEqual(done.result_summary["outcome"], "entity-avatar:performer:1")
+        self.assertEqual(told(done.result_summary)["outcome"], "entity-avatar:performer:1")
 
     def test_a_followup_that_says_continue_is_queued_again_in_place_until_it_stops(self):
         """存量要跑好几轮的后继：结算时说还没完，就在同一层、同一个父任务下再排一条，排在别的后继后面。"""
@@ -244,10 +282,11 @@ class RunnerTests(LedgerTestCase):
     def test_a_followup_that_steps_aside_waits_in_the_queue_and_runs_once_the_way_is_clear(self):
         """给扫描与采集让路的后继回到队列，不判失败；路让回来以后同一条接着跑完。"""
         clear = threading.Event()
-        attempts = []
+        attempts, checks = [], []
 
         class Blocked(JobDeferred):
             def ready(self):
+                checks.append(time.monotonic())
                 return clear.is_set()
 
         def busy_until_clear(_contract, key, _handle):
@@ -257,24 +296,83 @@ class RunnerTests(LedgerTestCase):
             return {"outcome": key}
 
         parent = self.parent()
+        # 兜底复查放到一分钟：路让回来只能靠本进程的通知，不能靠定时问。
         with registered(echo_type("ledger-a", run=busy_until_clear)), \
-                mock.patch.object(followups_module, "DEFER_POLL_SECONDS", 0.01):
+                mock.patch.object(followups_module, "DEFER_RECHECK_SECONDS", 60.0):
             child = self.store.enqueue_followups(parent.id, [("ledger-a:1", "ledger-a", "甲")])["queued"][0]
             runner = FollowupRunner(self.contract())
             runner.wake()
             deadline = time.monotonic() + 10
             while not attempts and time.monotonic() < deadline:
                 time.sleep(0.01)
-            time.sleep(0.05)
+            time.sleep(0.3)
             waiting = self.store.get(child)
             self.assertEqual(waiting.status, "pending")
             self.assertEqual(waiting.progress_label, "等待扫描与采集完成后继续")
             self.assertEqual(attempts, ["ledger-a:1"])
+            self.assertEqual(len(checks), 1, "让路期间不该反复来问")
             clear.set()
+            followups_module.deferrals_changed()
             self.wait_until_settled(parent.id)
             runner.stop(timeout=10)
         self.assertEqual(self.store.get(child).status, "succeeded")
         self.assertEqual(attempts, ["ledger-a:1", "ledger-a:1"])
+
+    def test_releasing_the_library_processing_lock_wakes_a_followup_that_stepped_aside(self):
+        """全库处理锁在本进程放开时直接叫醒让路的后继，不等兜底复查。"""
+        from peach import library_processing
+        from peach.settings_file import PeachConfig
+        config = PeachConfig(self.root, self.root / "config.toml")
+        config.directory("state").mkdir(parents=True, exist_ok=True)
+        attempts = []
+        held, release = threading.Event(), threading.Event()
+
+        def hold():
+            with library_processing._processing_lock(config, background=True, active=lambda: True):
+                held.set()
+                release.wait(10)
+
+        def needs_the_lock(_contract, key, _handle):
+            attempts.append(key)
+            if not library_processing._lock_free(config):
+                raise library_processing.ProcessingBusy(config)
+            return {"outcome": key}
+
+        parent = self.parent()
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join, 5)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        with registered(echo_type("ledger-a", run=needs_the_lock)), \
+                mock.patch.object(followups_module, "DEFER_RECHECK_SECONDS", 60.0):
+            child = self.store.enqueue_followups(parent.id, [("ledger-a:1", "ledger-a", "甲")])["queued"][0]
+            runner = FollowupRunner(self.contract())
+            # 断言失败时也先收通道线程，它握着的账本连接会挡住临时目录的删除。
+            self.addCleanup(runner.stop, timeout=10)
+            runner.wake()
+            # 运行函数记下尝试时这条还是 `running`，抛出 `ProcessingBusy` 后才回到队列。
+            deadline = time.monotonic() + 10
+            while (not attempts or self.store.get(child).status == "running") and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(attempts, ["ledger-a:1"])
+            self.assertEqual(self.store.get(child).status, "pending")
+            release.set()
+            self.wait_until_settled(parent.id, timeout=5)
+            runner.stop(timeout=10)
+        self.assertEqual(self.store.get(child).status, "succeeded")
+
+    def test_finish_listeners_hear_every_followup_that_ran(self):
+        heard = []
+        parent = self.parent()
+        with registered(echo_type(AVATAR_TASK_KEY)):
+            queued = self.store.enqueue_followups(
+                parent.id, [("entity-avatar:performer:1", AVATAR_TASK_KEY, "甲"),
+                            ("entity-avatar:performer:2", AVATAR_TASK_KEY, "乙")])["queued"]
+            runner = FollowupRunner(self.contract())
+            runner.on_finished(lambda run: heard.append(run.id))
+            self.assertEqual(runner.drain(), 2)
+        self.assertEqual(sorted(heard), sorted(queued))
 
     def test_a_busy_task_gate_keeps_the_lane_alive_until_the_followup_is_claimed(self):
         """闸门锁被别人拿着时领取等满超时：通道不退出，锁放开后照样领到这一条。"""
@@ -356,7 +454,7 @@ class RunnerTests(LedgerTestCase):
 
     def test_a_failed_followup_does_not_change_its_parent(self):
         def explode(_contract, _key, _handle):
-            raise RuntimeError("取不到这张图")
+            raise RuntimeError("image fetch failed")
 
         parent = self.parent()
         with registered(echo_type(AVATAR_TASK_KEY, run=explode)):
@@ -365,10 +463,10 @@ class RunnerTests(LedgerTestCase):
             self.store.finish(parent.id, "succeeded", summary={"followups": 1})
             with self.assertLogs("peach.followups", level="WARNING") as captured:
                 FollowupRunner(self.contract()).drain()
-            self.assertIn("取不到这张图", "\n".join(captured.output))
+            self.assertIn("image fetch failed", "\n".join(captured.output))
         child = self.store.get(queued[0])
         self.assertEqual(child.status, "failed")
-        self.assertIn("取不到这张图", child.error)
+        self.assertIn("image fetch failed", child.error)
         self.assertEqual(self.store.get(parent.id).status, "succeeded")
         self.assertEqual(self.store.get(parent.id).error, "")
 
@@ -439,7 +537,7 @@ class BackgroundJobDispatchTests(LedgerTestCase):
 
         def work(job_id):
             job.update(job_id, followups=self.declared())
-            raise RuntimeError("采集中断")
+            raise RuntimeError("collection interrupted")
 
         job.start(work)
         job.thread.join(5)
@@ -509,7 +607,7 @@ class AvatarFollowupTests(LedgerTestCase):
             avatar_root=avatars, candidate_root=self.root / "generated",
             database=self.database, task_runs=self.store, cache_bust=lambda: None)
         summary = avatar_run(contract, followup_key("performer", entity_id), None)
-        self.assertEqual(summary, {"outcome": "已有头像"})
+        self.assertEqual(told(summary), {"outcome": "已有头像"})
 
     def test_a_studio_key_is_not_an_avatar_followup(self):
         with self.assertRaises(ValueError):
@@ -524,7 +622,7 @@ class AvatarFollowupTests(LedgerTestCase):
             avatar_root=avatars, candidate_root=self.root / "generated",
             database=self.database, task_runs=self.store, cache_bust=lambda: None)
         summary = avatar_run(contract, followup_key("performer", 999), None)
-        self.assertEqual(summary, {"outcome": "档案已不存在"})
+        self.assertEqual(told(summary), {"outcome": "资料记录已不存在"})
 
 
 class CoverFaceFollowupTests(LedgerTestCase):
@@ -618,8 +716,8 @@ class CoverFaceFollowupTests(LedgerTestCase):
         other = self.entity("performer", "别人")
         self.work(4, "FC2-PPV-4", (900, 600), performers=(self.person, other))
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]),
-                         ("已装上", "作品封面 FC2-PPV-3"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]),
+                         ("已保存资料图片", "作品封面 FC2-PPV-3"))
         record = self.provenance()
         self.assertEqual((record["provider"], record["external_id"], record["face_px"]),
                          ("cover-face", "FC2-PPV-3", 90))
@@ -656,22 +754,22 @@ class CoverFaceFollowupTests(LedgerTestCase):
     def test_a_thumbnail_is_the_floor_not_nothing(self):
         self.work(1, "FC2-PPV-1", (1800, 1000))
         self.work(2, "FC2-PPV-2", (276, 154))
-        self.assertEqual(self.run_followup()["source"], "作品封面 FC2-PPV-2")
+        self.assertEqual(told(self.run_followup())["source"], "作品封面 FC2-PPV-2")
         self.assertEqual(self.provenance()["face_px"], 55)
 
     def test_a_clearer_cover_later_replaces_the_crop_and_nothing_else_does(self):
         self.work(2, "FC2-PPV-2", (276, 154))
         self.run_followup()
-        self.assertEqual(self.run_followup()["outcome"], "已是最清楚的封面人脸")
+        self.assertEqual(told(self.run_followup())["outcome"], "已是最清楚的封面人脸")
         self.work(5, "FC2-PPV-5", (1000, 600))
-        self.assertEqual(self.run_followup()["source"], "作品封面 FC2-PPV-5")
+        self.assertEqual(told(self.run_followup())["source"], "作品封面 FC2-PPV-5")
         self.assertEqual(self.provenance()["face_px"], 300)
 
     def test_a_blurred_cover_is_passed_over_even_with_the_widest_face(self):
         """卖家打了模糊的商品图：整张检得出很宽的脸，截出来那块认不出人，挑下一张。"""
         self.work(1, "FC2-PPV-1", (900, 600), colour=self.BLURRED)
         self.work(2, "FC2-PPV-2", (276, 154))
-        self.assertEqual(self.run_followup()["source"], "作品封面 FC2-PPV-2")
+        self.assertEqual(told(self.run_followup())["source"], "作品封面 FC2-PPV-2")
 
     def test_an_unreadable_crop_installed_earlier_gives_way_to_a_narrower_face(self):
         self.work(2, "FC2-PPV-2", (276, 154))
@@ -680,7 +778,7 @@ class CoverFaceFollowupTests(LedgerTestCase):
         from PIL import Image
         Image.new("RGB", (400, 400), self.BLURRED).save(
             self.avatars / f"performer-{self.person}.img", format="JPEG")
-        self.assertEqual(self.run_followup()["source"], "作品封面 FC2-PPV-2")
+        self.assertEqual(told(self.run_followup())["source"], "作品封面 FC2-PPV-2")
         self.assertEqual(self.provenance()["face_px"], 55)
 
     def test_a_whole_cover_installed_earlier_gives_way_to_any_face(self):
@@ -688,7 +786,7 @@ class CoverFaceFollowupTests(LedgerTestCase):
         (self.avatars / f"performer-{self.person}.img").write_bytes(b"jpeg")
         (self.avatars / f"performer-{self.person}.img.provenance.json").write_text(
             json.dumps({"provider": "cover-fallback"}), encoding="utf-8")
-        self.assertEqual(self.run_followup()["source"], "作品封面 FC2-PPV-2")
+        self.assertEqual(told(self.run_followup())["source"], "作品封面 FC2-PPV-2")
         self.assertEqual(self.provenance()["provider"], "cover-face")
 
     def test_a_picture_someone_chose_is_never_replaced(self):
@@ -696,12 +794,12 @@ class CoverFaceFollowupTests(LedgerTestCase):
         (self.avatars / f"performer-{self.person}.img").write_bytes(b"jpeg")
         (self.avatars / f"performer-{self.person}.img.provenance.json").write_text(
             json.dumps({"provider": "picker"}), encoding="utf-8")
-        self.assertEqual(self.run_followup(), {"outcome": "已有头像"})
+        self.assertEqual(told(self.run_followup()), {"outcome": "已有头像"})
 
     def test_no_face_on_any_cover_installs_nothing(self):
         self.work(1, "FC2-PPV-1", (1800, 1000))
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库里没有这个名字，封面上没有能截的脸")
+        self.assertEqual(told(summary)["outcome"], "图库里没有这个名字，封面上没有能截的脸")
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_a_missing_face_model_is_flagged_and_not_recorded_as_tried(self):
@@ -716,7 +814,7 @@ class CoverFaceFollowupTests(LedgerTestCase):
 
         with mock.patch("peach.avatar_face.FaceProbe", Down):
             summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库里没有这个名字，人脸模型不可用：取人脸模型失败：断网")
+        self.assertEqual(told(summary)["outcome"], "图库里没有这个名字，人脸模型不可用：取人脸模型失败：断网")
         self.assertIs(summary["face_match_unavailable"], True)
         from peach.followups import attempts_root
         self.assertFalse(any(attempts_root(self.root / "generated").glob("*")))
@@ -860,7 +958,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.work(1, "IPX-001", self.HER)
         self.work(2, "SSIS-002", self.HER)
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "已装上")
+        self.assertEqual(told(summary)["outcome"], "已保存资料图片")
         self.assertEqual((summary["matched"], summary["size"]), (3, "400×600"))
         record = self.provenance()
         self.assertEqual((record["provider"], record["source_kind"]),
@@ -922,7 +1020,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         contract.gfriends_index = avatar_picker.IndexRefresher(index_path.parent, lambda: send)
         from peach.avatar_followup import run
         summary = run(contract, followup_key("performer", self.person), mock.Mock())
-        self.assertEqual(summary["outcome"], "已装上")
+        self.assertEqual(told(summary)["outcome"], "已保存资料图片")
         self.assertEqual(self.provenance()["provider"], "gfriends")
         self.assertEqual(requests, [gfriends.INDEX_URL])
 
@@ -949,7 +1047,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         hers = self.candidate("7-S1", (400, 600), self.HER)
         self.work(1, "IPX-001", self.HER)
         self.work(2, "SSIS-002", self.HER)
-        self.assertEqual(self.run_followup()["outcome"], "已装上")
+        self.assertEqual(told(self.run_followup())["outcome"], "已保存资料图片")
         record = self.provenance()
         self.assertEqual(f"gfriends:{record['external_id']}", hers)
         self.assertEqual(record["face_match"]["compared"], 2)
@@ -970,7 +1068,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         again = self.candidate("3-Moodyz", (400, 600), self.HER_AGAIN)
         self.work(1, "IPX-001", self.HER)
         self.work(2, "SSIS-002", self.STRANGER)
-        self.assertEqual(self.run_followup()["outcome"], "已装上")
+        self.assertEqual(told(self.run_followup())["outcome"], "已保存资料图片")
         record = self.provenance()
         self.assertEqual(f"gfriends:{record['external_id']}", hers)
         self.assertEqual(record["face_match"]["required"], 2)
@@ -998,7 +1096,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         hers = self.candidate("1-S1", (400, 600), self.HER)
         again = self.candidate("3-Moodyz", (400, 600), self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]), ("已装上", "S1（按图库互证认定）"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]), ("已保存资料图片", "S1（按图库互证认定）"))
         record = self.provenance()
         self.assertEqual((record["provider"], record["source_kind"]),
                          ("gfriends", "gallery_face_matched"))
@@ -1013,7 +1111,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         again = self.candidate("3-Moodyz", (400, 600), self.HER_AGAIN)
         self.work(1, "IPX-001", self.STRANGER)
         summary = self.run_followup()
-        self.assertEqual(summary["source"], "S1（按图库互证认定）")
+        self.assertEqual(told(summary)["source"], "S1（按图库互证认定）")
         record = self.provenance()
         self.assertEqual(f"gfriends:{record['external_id']}", hers)
         match = record["face_match"]
@@ -1047,7 +1145,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.candidate("1-S1", (400, 600), self.HER)
         self.candidate("2-Ideapocket", (400, 600), self.HER)
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库 2 张彼此认不出同一个人，封面上没有能截的脸")
+        self.assertEqual(told(summary)["outcome"], "图库 2 张彼此认不出同一个人，封面上没有能截的脸")
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_a_pair_among_strangers_is_a_minority_and_installs_nothing(self):
@@ -1057,14 +1155,14 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.candidate("3-Moodyz", (400, 600), self.STRANGER)
         self.candidate("4-Fitch", (400, 600), self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库 4 张彼此认不出同一个人，封面上没有能截的脸")
+        self.assertEqual(told(summary)["outcome"], "图库 4 张彼此认不出同一个人，封面上没有能截的脸")
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_one_picture_alone_is_still_not_enough_without_a_cover(self):
         self.candidate("1-S1", (400, 600), self.HER)
         self.candidate("2-Ideapocket", (400, 600), self.BLANK)
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库 2 张认不准，封面上没有能截的脸")
+        self.assertEqual(told(summary)["outcome"], "图库 2 张认不准，封面上没有能截的脸")
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_no_match_falls_back_to_the_cover_face(self):
@@ -1073,8 +1171,8 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.candidate("2-Ideapocket", (400, 600), self.OTHER)
         self.work(1, "IPX-001", self.HER)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]),
-                         ("已装上", "作品封面 IPX-001"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]),
+                         ("已保存资料图片", "作品封面 IPX-001"))
         self.assertEqual(self.provenance()["provider"], "cover-face")
 
     def test_without_the_model_she_falls_back_and_is_tried_again_next_round(self):
@@ -1122,8 +1220,8 @@ class FaceMatchFollowupTests(FaceStubCase):
         big = self.candidate("0-Hand-Storage", (832, 1249), self.HER)
         small = self.candidate("y-Minnano", (399, 393), self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]),
-                         ("已装上", "Hand-Storage（按图库互证认定）"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]),
+                         ("已保存资料图片", "Hand-Storage（按图库互证认定）"))
         record = self.provenance()
         self.assertEqual(f"gfriends:{record['external_id']}", big)
         self.assertEqual(record["face_match"]["corroborated_by"], {"ref": small, "score": 0.8})
@@ -1133,11 +1231,11 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.candidate("y-AVDC", (199, 299), self.HER)
         bigger = self.candidate("y-Minnano", (470, 470), self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["size"]), ("已装上", "470×470"))
+        self.assertEqual((told(summary)["outcome"], summary["size"]), ("已保存资料图片", "470×470"))
         record = self.provenance()
         self.assertEqual(record["source_kind"], "gallery_small")
         self.assertEqual(f"gfriends:{record['external_id']}", bigger)
-        self.assertTrue(self.run_followup()["outcome"].endswith("已装着认得准的小图"))
+        self.assertTrue(told(self.run_followup())["outcome"].endswith("已保留身份核对通过的小尺寸图片"))
 
     def test_small_pictures_of_different_people_install_nothing(self):
         self.candidate("y-AVDC", (199, 299), self.HER)
@@ -1150,7 +1248,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.work(1, "IPX-001", self.HER)
         self.assertEqual(self.run_followup()["size"], "350×350")
         self.assertEqual(f"gfriends:{self.provenance()['external_id']}", ref)
-        self.assertEqual(self.run_followup()["outcome"], "已装着认得准的小图")
+        self.assertEqual(told(self.run_followup())["outcome"], "已保留身份核对通过的小尺寸图片")
 
     def test_a_profile_can_replace_an_automatic_cover_crop(self):
         self.work(1, "IPX-001", self.HER)
@@ -1174,7 +1272,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         avatar_picker.install(self.providers, self.avatars, "performer", self.person, body,
                               {"provider": "gfriends", "source_kind": "user_cropped"})
         self.candidate("y-Minnano", (350, 350), self.HER)
-        self.assertEqual(self.run_followup()["outcome"], "已有头像")
+        self.assertEqual(told(self.run_followup())["outcome"], "已有头像")
         self.assertEqual((self.avatars / f"performer-{self.person}.img").read_bytes(), body)
 
     def test_an_automatic_official_thumbnail_can_use_a_verified_gallery_portrait(self):
@@ -1205,7 +1303,7 @@ class FaceMatchFollowupTests(FaceStubCase):
                                "user_selected": True})
         self.candidate("1-S1", (400, 600), self.HER)
         self.candidate("3-Moodyz", (400, 600), self.HER_AGAIN)
-        self.assertEqual(self.run_followup()["outcome"], "已有头像")
+        self.assertEqual(told(self.run_followup())["outcome"], "已有头像")
         self.assertEqual((self.avatars / f"performer-{self.person}.img").read_bytes(), body)
 
     def test_a_manually_selected_cover_face_is_not_queued_or_replaced(self):
@@ -1218,7 +1316,7 @@ class FaceMatchFollowupTests(FaceStubCase):
         self.candidate("1-S1", (400, 600), self.HER)
         self.candidate("3-Moodyz", (400, 600), self.HER_AGAIN)
         self.assertFalse(needs_avatar(self.avatars, "performer", self.person))
-        self.assertEqual(self.run_followup()["outcome"], "已有头像")
+        self.assertEqual(told(self.run_followup())["outcome"], "已有头像")
         self.assertEqual((self.avatars / f"performer-{self.person}.img").read_bytes(), body)
 
     def test_deciding_who_needs_an_avatar_does_not_hash_the_installed_pictures(self):
@@ -1280,7 +1378,7 @@ class OffsiteCoverFaceTests(FaceStubCase):
                 from peach.performer_alias_followup import Blocked
 
                 if test.blocked:
-                    raise Blocked("avwikidb 在冷却")
+                    raise Blocked("errors.performerAliasFollowup.coolingDown")
                 test.pages.append(url)
                 singles = sum(len(work["actor"]) == 1 and
                               work["actor"][0]["fanzaAvActressId"] == test.ACTOR
@@ -1340,8 +1438,8 @@ class OffsiteCoverFaceTests(FaceStubCase):
         self.listed("ABF-001", "118abf00001", self.HER)
         self.listed("ABF-002", "118abf00002", self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]),
-                         ("已装上", "馆外单人作品封面 ABF-001（2 部互证）"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]),
+                         ("已保存资料图片", "馆外单人作品封面 ABF-001（2 部互证）"))
         record = self.provenance()
         self.assertEqual((record["provider"], record["identity_verified"], record["offsite"]),
                          ("cover-face", False, True))
@@ -1356,7 +1454,7 @@ class OffsiteCoverFaceTests(FaceStubCase):
         self.actor_page_limit = 1
         self.listed("ABF-001", "118abf00001", self.HER)
         self.listed("ABF-002", "118abf00002", self.HER_AGAIN)
-        self.assertEqual(self.run_followup()["outcome"], "已装上")
+        self.assertEqual(told(self.run_followup())["outcome"], "已保存资料图片")
         self.assertEqual(len(self.pages), 2)
         self.assertEqual(sorted(self.provenance()["face_match"]["codes"]), ["ABF-001", "ABF-002"])
 
@@ -1365,7 +1463,7 @@ class OffsiteCoverFaceTests(FaceStubCase):
         self.listed("ABF-001", "118abf00001", self.HER)
         self.listed("ABF-002", "118abf00002", None)
         summary = self.run_followup()
-        self.assertIn("凑不齐两部互证", summary["outcome"])
+        self.assertIn("凑不齐两部互证", told(summary)["outcome"])
         self.assertEqual(summary["kept"], 1)
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
@@ -1373,14 +1471,14 @@ class OffsiteCoverFaceTests(FaceStubCase):
         self.bind()
         self.listed("ABF-001", "118abf00001", self.HER)
         self.listed("ABF-002", "118abf00002", self.STRANGER)
-        self.assertIn("凑不齐两部互证", self.run_followup()["outcome"])
+        self.assertIn("凑不齐两部互证", told(self.run_followup())["outcome"])
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_the_same_photo_on_two_covers_is_one_piece_of_evidence(self):
         self.bind()
         self.listed("ABF-001", "118abf00001", self.HER)
         self.listed("ABF-002", "118abf00002", self.HER)
-        self.assertIn("凑不齐两部互证", self.run_followup()["outcome"])
+        self.assertIn("凑不齐两部互证", told(self.run_followup())["outcome"])
         self.assertFalse((self.avatars / f"performer-{self.person}.img").exists())
 
     def test_works_with_someone_else_and_works_in_the_library_are_not_fetched(self):
@@ -1396,7 +1494,7 @@ class OffsiteCoverFaceTests(FaceStubCase):
     def test_without_an_avwikidb_id_nothing_is_fetched(self):
         self.listed("ABF-001", "118abf00001", self.HER)
         summary = self.run_followup()
-        self.assertEqual(summary["outcome"], "图库里没有这个名字，封面上没有能截的脸")
+        self.assertEqual(told(summary)["outcome"], "图库里没有这个名字，封面上没有能截的脸")
         self.assertEqual(self.fetched, [])
 
     def test_a_blocked_site_is_tried_again_next_round(self):
@@ -1407,7 +1505,7 @@ class OffsiteCoverFaceTests(FaceStubCase):
         self.blocked = True
         summary = self.run_followup()
         self.assertTrue(summary["source_unavailable"])
-        self.assertIn("avwikidb 单人作品未取得", summary["outcome"])
+        self.assertIn("avwikidb 单人作品未取得", told(summary)["outcome"])
         with self.database.read_connection() as connection:
             current = fingerprint(connection, self.person)
         key = followup_key("performer", self.person)
@@ -1508,8 +1606,8 @@ class AccountFaceFollowupTests(FaceStubCase):
         self.post(1, self.HER)
         self.post(2, self.HER_AGAIN)
         summary = self.run_followup()
-        self.assertEqual((summary["outcome"], summary["source"]),
-                         ("已装上", "作品画面 ASSET-ID-1（2 部互证）"))
+        self.assertEqual((told(summary)["outcome"], told(summary)["source"]),
+                         ("已保存资料图片", "作品画面 ASSET-ID-1（2 部互证）"))
         record = self.provenance()
         self.assertEqual((record["provider"], record["identity_verified"], record["sheet_cell"]),
                          ("cover-face", False, 0))
@@ -1520,20 +1618,20 @@ class AccountFaceFollowupTests(FaceStubCase):
         self.post(1, self.HER)
         self.post(2, self.STRANGER)
         summary = self.run_followup()
-        self.assertIn("凑不齐两部互证", summary["outcome"])
+        self.assertIn("凑不齐两部互证", told(summary)["outcome"])
         self.assertEqual(summary["kept"], 2)
         self.assertFalse((self.avatars / f"creator-{self.account}.img").exists())
 
     def test_nine_cells_of_one_work_are_one_piece_of_evidence(self):
         self.post(1, self.HER)
-        self.assertIn("凑不齐两部互证", self.run_followup()["outcome"])
+        self.assertIn("凑不齐两部互证", told(self.run_followup())["outcome"])
         self.assertFalse((self.avatars / f"creator-{self.account}.img").exists())
 
     def test_works_shared_with_another_account_are_not_read(self):
         other = self.entity("creator", "另一个号")
         self.post(1, self.HER)
         self.post(2, self.HER_AGAIN, owners=(self.account, other))
-        self.assertIn("凑不齐两部互证", self.run_followup()["outcome"])
+        self.assertIn("凑不齐两部互证", told(self.run_followup())["outcome"])
 
     def test_an_account_without_identity_is_neither_planned_nor_recorded(self):
         from peach.avatar_followup import NO_IDENTITY, fingerprint, stock
@@ -1551,7 +1649,7 @@ class AccountFaceFollowupTests(FaceStubCase):
         from peach.avatar_followup import run as avatar_run
 
         key = followup_key("creator", unknown)
-        self.assertEqual(avatar_run(self.contract(), key, mock.Mock())["outcome"], NO_IDENTITY)
+        self.assertEqual(codes(avatar_run(self.contract(), key, mock.Mock())), [NO_IDENTITY])
         with self.database.read_connection() as connection:
             current = fingerprint(connection, unknown)
         self.assertFalse(attempts.settled(key, current))
@@ -1575,7 +1673,7 @@ class AccountFaceFollowupTests(FaceStubCase):
         with self.database.write_transaction(notify=False) as connection:
             connection.execute("UPDATE asset SET snapshot_path=? WHERE id=2", (str(path),))
         self.assertEqual(planned(), [key])
-        self.assertEqual(self.run_followup()["outcome"], "已装上")
+        self.assertEqual(told(self.run_followup())["outcome"], "已保存资料图片")
 
 
 class ProcessLibraryTests(LedgerTestCase):
@@ -1614,8 +1712,8 @@ class ProcessLibraryTests(LedgerTestCase):
 
     def provider(self):
         provider = mock.Mock()
-        provider.amane.side_effect = NotFound('片商官网没有这个番号')
-        provider.community.side_effect = NotFound('社区来源都没有这个番号')
+        provider.amane.side_effect = NotFound('errors.libraryProcessing.amaneSitesSaidNo')
+        provider.community.side_effect = NotFound('errors.libraryProcessing.communitySaidNo')
         provider.cover.return_value = False
         provider.query.return_value = {
             'id': 'ABW-358',
@@ -1657,7 +1755,8 @@ class ProcessLibraryTests(LedgerTestCase):
         # 三、真的被跑掉，收在终态。补别名、补女优资料的各站都换成取不到页的替身，不联网。
         class Offline:
             def get(self, _url):
-                raise performer_alias_followup.Unavailable('测试里不联网')
+                raise performer_alias_followup.Unavailable('errors.performerAliasFollowup.networkFailed',
+                                                          {'type': 'ConnectError'})
 
             def close(self):
                 pass
@@ -1681,13 +1780,13 @@ class ProcessLibraryTests(LedgerTestCase):
                                   return_value=profile_offline):
             self.assertEqual(FollowupRunner(contract).drain(), 4)
         seeded = self.store.get(queued[0])
-        self.assertEqual((seeded.status, seeded.result_summary['outcome']), ('succeeded', '别名 1'))
+        self.assertEqual((seeded.status, told(seeded.result_summary)['outcome']), ('succeeded', '别名 1'))
         self.assertTrue((self.root / 'generated' / seed_followup.REVIEW_FILE).exists(),
                         '种子导入跑完留下复核产物，哪怕这一轮没有可看的项')
         done = self.store.get(queued[1])
         self.assertEqual(done.status, 'succeeded')
-        self.assertEqual(done.result_summary['outcome'], '图库里没有这个名字，封面上没有能截的脸')
-        self.assertEqual(self.store.get(queued[2]).result_summary['outcome'], '未取得')
+        self.assertEqual(told(done.result_summary)['outcome'], '图库里没有这个名字，封面上没有能截的脸')
+        self.assertEqual(told(self.store.get(queued[2]).result_summary)['outcome'], '未取得')
         self.assertEqual(self.store.get(queued[3]).status, 'succeeded')
         self.assertFalse((self.root / 'generated' / 'avatars'
                           / f'performer-{entity_id}.img').exists())
@@ -1703,7 +1802,7 @@ class TaskPayloadTests(LedgerTestCase):
             calls.append('run')
             if len(calls) == 1:
                 tokens.append(update_tasks.reserve(self.db))
-                raise JobPaused('安装期间暂停')
+                raise JobPaused('errors.updateTasks.pausedForInstall')
             return {'outcome':'完成'}
         kind = echo_type('upgrade-test', run=work)
         parent = self.parent()

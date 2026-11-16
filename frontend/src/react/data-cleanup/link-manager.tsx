@@ -10,7 +10,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { RiExternalLinkLine } from '@remixicon/react';
 import { useQuery } from '@tanstack/react-query';
-import { confirmModal } from '@peach/legacy/ui';
 import { entityPath, esc, firstGrapheme } from '@peach/legacy/core';
 import { entityFaceImg } from '@peach/card-art';
 
@@ -21,13 +20,16 @@ import { StatusLabel } from '../components/status-label';
 import { errorMessage } from '../../api';
 import { ErrorExcerpt } from '../activity/error-excerpt';
 import { useBackgroundJob } from '../background-job';
+import { runBulkAction, type BulkAction } from '../components/bulk-action';
 import { DataTable, type DataColumn } from '../components/data-table';
+import type { DockAction } from '../components/selection-dock';
 import {
   Fieldset, FieldsetTitle, RESULT_PANEL, RESULT_SECTION,
 } from '../components/fieldset';
 import { Note } from '../components/note';
 import { SiteMark } from '../components/site-mark';
 import { TaskProgress } from '../components/task-progress';
+import { activityKind } from '../../activity-kinds';
 import { spriteGlyph } from '../components/sprite-glyph';
 import { LEGACY_AVATAR_IMG } from '../components/legacy-avatar';
 import { LinkCheckIcon } from './link-check-icon';
@@ -38,7 +40,9 @@ import {
   LINK_PRUNE_KEY, LINKS_KEY, pruneText, startLinkCheck, startLinkPrune,
   type LinkCheckState, type LinkPruneState, type LinkRow,
 } from './links';
+import { jobText, serverLabel } from '../../core/server-text';
 import { t } from '../../i18n';
+import { linkLabel } from '../../core/stored-values';
 
 const RETRY = spriteGlyph('rotate-cw');
 
@@ -63,10 +67,11 @@ function Stat({ label, value, note }: { label: string; value: string; note?: str
 }
 
 function LinkTable(
-  { title, items, hint, picked, onPick, children, footer, confirmed = false }:
+  { title, items, hint, picked, onPick, actions, controls, footer, confirmed = false }:
   {
     title: string; items: LinkRow[]; hint: string;
-    picked: readonly number[]; onPick(next: number[]): void; children?: ReactNode; footer?: ReactNode; confirmed?: boolean;
+    picked: readonly number[]; onPick(next: number[]): void; footer?: ReactNode; confirmed?: boolean;
+    actions?(chosen: LinkRow[]): readonly DockAction[]; controls?: ReactNode;
   },
 ) {
   if (!items.length) return null;
@@ -74,7 +79,7 @@ function LinkTable(
     { id: 'entity', label: t('cleanup:links.columnEntry'), width: 180, min: 128, value: (item) => item.entity,
       render: (item) => <a className="flex min-w-24 items-center gap-2 text-text-secondary hover:text-text-primary hover:underline"
         href={item.entity_id && item.entity_kind ? entityPath(item.entity_kind, item.entity, item.entity_id) : undefined} data-link-identity="">
-        <span data-link-avatar="" className={`relative flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-background-quaternary-default text-caption-1-medium text-text-primary ${LEGACY_AVATAR_IMG}`}
+        <span data-link-avatar="" className={`relative flex size-6 shrink-0 items-center justify-center overflow-hidden rounded-full bg-media-placeholder text-caption-1-medium text-text-primary ${LEGACY_AVATAR_IMG}`}
           aria-hidden dangerouslySetInnerHTML={{ __html: `<span>${esc(firstGrapheme(item.entity))}</span>` + entityFaceImg({
             kind: item.entity_kind, id: item.entity_id, hasImage: item.face?.has_image,
             version: item.face?.image_version, focus: item.face?.avatar_focus, thumb: true,
@@ -84,15 +89,15 @@ function LinkTable(
       </a> },
     { id: 'kind', label: t('cleanup:shared.type'), width: 128, value: (item) => LINK_KINDS[item.link_kind] || item.link_kind,
       render: (item) => LINK_KINDS[item.link_kind] || item.link_kind },
-    { id: 'label', label: t('cleanup:links.columnName'), min: 128, value: (item) => item.label || '',
+    { id: 'label', label: t('cleanup:links.columnName'), min: 128, value: (item) => linkLabel(item.label),
       render: (item) => <span className="flex min-w-24 items-center gap-2" data-link-name="">
-        <span className="min-w-0 wrap-anywhere">{item.label || new URL(item.url).hostname}</span></span> },
+        <span className="min-w-0 wrap-anywhere">{linkLabel(item.label) || new URL(item.url).hostname}</span></span> },
     { id: 'note', label: t('cleanup:links.columnResult'), width: 320, min: 192, value: (item) => item.note,
       render: (item) => <div className="min-w-0 w-full" data-link-result={confirmed ? 'gone' : 'unclear'}>
         {/^(?:HTTP\s+)?[1-5]\d{2}$/.test(item.note.trim())
           ? <StatusLabel tone={confirmed || /^(?:HTTP\s+)?5\d{2}$/.test(item.note.trim()) ? 'error' : 'warning'} data-link-code="">{item.note.trim()}</StatusLabel>
           : <div className="flex flex-col items-start gap-1"><StatusLabel tone={confirmed ? 'error' : 'warning'}>{confirmed ? t('cleanup:links.dead') : t('cleanup:links.inconclusive')}</StatusLabel>
-              <ErrorExcerpt text={item.note} className="tabular-nums text-text-secondary" /></div>}
+              <ErrorExcerpt text={serverLabel(item.note_code ?? '', item.note, item.note_params)} className="tabular-nums text-text-secondary" /></div>}
       </div> },
     { id: 'url', label: t('cleanup:links.columnUrl'), width: 360, min: 180, value: (item) => item.url,
       render: (item) => <a href={item.url} target="_blank" rel="noopener noreferrer" title={item.url} data-link-address=""
@@ -106,9 +111,9 @@ function LinkTable(
     <div className={RESULT_SECTION} data-link-results={confirmed ? 'gone' : 'unclear'}>
       <DataTable label={title} items={items} columns={columns} rowId={(item) => String(item.id)}
         description={hint} unit={t('cleanup:links.unit')} panel={false} footerActions={footer}
-        rowLabel={(item) => t('cleanup:links.rowLabel', { entity: item.entity, link: item.label || item.url })}
+        rowLabel={(item) => t('cleanup:links.rowLabel', { entity: item.entity, link: linkLabel(item.label) || item.url })}
         selected={picked.map(String)} onSelected={(ids) => onPick(ids.map(Number))}
-        actions={() => children} />
+        actions={(chosen) => actions?.(chosen) ?? []} controls={() => controls} />
     </div>
   );
 }
@@ -155,15 +160,18 @@ export function LinkManager() {
     if (!actionsReady || running || (retry && !retry.length)) return;
     check.start.mutate(retry ? { retry, checkId } : {});
   };
-  const removeGone = (ids?: number[]) => {
+  /* 删除是一趟后台任务，结论由任务那块回执说；删了撤不回，弹窗写明。`all` 时不带 id，删整份清单。 */
+  const removeGone = (label: string, all = false): BulkAction<LinkRow> => ({
+    key: all ? 'prune-all' : 'prune', label, reversal: 'irreversible', danger: true,
+    confirm: (rows) => ({ title: t('cleanup:links.deleteDead'), danger: true,
+      body: t('cleanup:links.deleteDeadBody', { count: rows.length }) }),
+    run: async (rows) => { await prune.start.mutateAsync({ checkId, ids: all ? undefined : rows.map((row) => row.id) }) },
+    receipt: () => '',
+  });
+  const host = { receipt: () => {} };
+  const removeAll = () => {
     if (!actionsReady || removing || !gone.length) return;
-    void confirmModal({
-      title: t('cleanup:links.deleteDead'),
-      body: t('cleanup:links.deleteDeadBody', { count: ids?.length ?? gone.length }),
-      confirmLabel: t('cleanup:links.deleteDead'),
-      danger: true,
-      onConfirm: () => prune.start.mutateAsync({ checkId, ids }),
-    });
+    void runBulkAction(removeGone(t('cleanup:links.deleteDead'), true), gone, host);
   };
 
   /* 删除那一趟跑完，结论就是那一句回执：旧清单里的行已经删掉或者确认保留了。 */
@@ -172,7 +180,7 @@ export function LinkManager() {
   let progress: ReactNode = null;
   let result: ReactNode = null;
   if (pruned?.status === 'failed') {
-    result = <Note tone="error" title={t('cleanup:links.pruneIncomplete')}>{pruned.error || t('cleanup:links.checkTaskLog')}</Note>;
+    result = <Note tone="error" title={t('cleanup:links.pruneIncomplete')}>{jobText(pruned, 'error') || t('cleanup:links.checkTaskLog')}</Note>;
   } else if (pruned && !gone.length && !unclear.length) {
     result = <Note tone="success" title={t('cleanup:links.pruneDone')}>{pruneText(pruned)}</Note>;
   } else if (startError) {
@@ -180,14 +188,14 @@ export function LinkManager() {
   } else if (check.query.isError && state) {
     result = <Note tone="neutral" title={t('cleanup:shared.taskStatus')}>{DISCONNECTED}</Note>;
   } else if (state?.status === 'failed') {
-    result = <Note tone="error" title={t('cleanup:links.checkFailed')}>{state.error || t('cleanup:links.checkFailed')}</Note>;
+    result = <Note tone="error" title={t('cleanup:links.checkFailed')}>{jobText(state, 'error') || t('cleanup:links.checkFailed')}</Note>;
   } else if (state && state.status !== 'idle') {
     progress = <>
       {state.status === 'running'
-        ? <TaskProgress embedded label={checkLine(state)} value={Math.min(state.checked || 0, state.total || 0)} total={state.total} />
+        ? <TaskProgress embedded kind={activityKind('link-check')} label={checkLine(state)} value={Math.min(state.checked || 0, state.total || 0)} total={state.total} />
         : null}
       {removing
-        ? <TaskProgress embedded label={prune.job?.message || t('cleanup:links.pruning')}
+        ? <TaskProgress embedded kind={activityKind('link-prune')} label={jobText(prune.job) || t('cleanup:links.pruning')}
             value={Math.min(prune.job?.checked || 0, prune.job?.total || 0)} total={prune.job?.total} />
         : null}
     </>;
@@ -198,27 +206,21 @@ export function LinkManager() {
         <LinkTable title={t('cleanup:links.dead')} items={gone} hint={GONE_HINT} picked={gonePicked} onPick={setGonePicked} confirmed
           footer={done && gone.length ? <>
             <p className="mr-auto min-w-0 text-caption-1-regular text-text-secondary">{PRUNE_HINT}</p>
-            <Button variant="danger" {...busyProps(removing)} onClick={() => removeGone()}>
+            <Button variant="danger" {...busyProps(removing)} onClick={removeAll}>
               {t('cleanup:links.deleteDeadCount', { count: gone.length })}
             </Button>
-          </> : null}>
-          <Button variant="danger" size="small" disabled={!done || !selectedGone.length}
-            {...busyProps(removing)} onClick={() => removeGone(selectedGone)}>
-            {t('cleanup:links.deleteSelected', { count: selectedGone.length })}
-          </Button>
-        </LinkTable>
+          </> : null}
+          actions={(chosen) => [{ action: removeGone(t('cleanup:links.deleteSelected', { count: selectedGone.length })),
+            items: chosen, host, disabled: !done || removing }]} />
         <LinkTable title={t('cleanup:links.unreached')} items={unclear} hint={UNCLEAR_HINT}
           picked={picked} onPick={setPicked} footer={retryable.length
             ? <Button variant="primary" leadingIcon={RETRY} {...busyProps(running)}
                 onClick={() => run(retryable.map((item) => item.id))}>{t('cleanup:links.retryAll', { count: retryable.length })}</Button>
-            : null}>
-          {retryable.length
-            ? <>
-                  <Button variant="secondary" leadingIcon={RETRY} disabled={!selectedRetryable.length} {...busyProps(running)}
-                    onClick={() => run(selectedRetryable)}>{pickedLabel}</Button>
-              </>
             : null}
-        </LinkTable>
+          controls={retryable.length
+            ? <Button variant="secondary" leadingIcon={RETRY} disabled={!selectedRetryable.length} {...busyProps(running)}
+                onClick={() => run(selectedRetryable)}>{pickedLabel}</Button>
+            : null} />
         {done && !gone.length && !unclear.length
           ? <p className={`${RESULT_SECTION} text-body-regular text-notification-success-foreground`}>{t('cleanup:links.allReachable')}</p>
           : null}

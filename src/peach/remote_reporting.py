@@ -11,25 +11,31 @@ import re
 import subprocess
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import interface_text
 from .reporting_identity import event_metadata, machine_facts
 from .diagnostic_exceptions import media_details
+from .user_messages import UserFacingError, UserValueError
 
-FIELDS = {
-    "usage": "Peach 版本、分发方式（Windows／macOS 应用、Docker、wheel 或源码）、操作系统类型与版本、CPU 架构与核数、内存档位、Python 版本、运行环境与公开构建编号；每天最多一条活跃日志和一条日联系会话汇总。开启后自动生成随机技术实例标识，用于统计受影响实例和升级路径，与研究标识独立；关闭后移除本机标识，再开启生成新值。连续运行时按 UTC 日统计，代表运行中的实例，不代表人数、真实会话或当天有人操作。",
-    "errors": "诊断补充：故障环节、异常链、Peach 与白名单框架的代码文件名/函数名/行号、结构化错误码、媒体工具故障类别、浏览器白名单异常类型与正式脚本构建映射、客户端浏览器品牌及主要版本与系统大类、HTTP 方法/路由模板/关联错误编号、同类故障次数与统计日期；同一版本的同类故障只上传一次完整诊断，每天最多 5 条，全部发生次数每 6 小时或退出时合并为计数日志。盘掉线、媒体缺失或损坏、磁盘满、超时与数据库忙等环境条件只统计类别、代码位置与次数，不上传完整诊断。",
-}
+#: 两类上报，各自的「上传哪些字段」说明是 `labels.remoteReporting.field.<类>`（ADR-0159）。
+FIELDS = ("usage", "errors")
 CONSENT_SCHEMA = 2
-NOTICE = "发送至 Sentry。不上报错误原文、完整日志、诊断 ZIP、媒体名称、路径、网址、观看记录或凭据。接收服务会接触连接 IP；关闭后停止新发送，已发送的信息无法撤回。"
+NOTICE_CODE = "labels.remoteReporting.notice"
 _lock = threading.RLock()
 _client = None
 _client_dsn = ""
 _disabled = False
 _frequency_timer = None
+#: 定时器真正要处理的时刻（UNIX 秒）；长等待分段时中途醒来只比时间，不读写文件。
+_frequency_due = None
 _frequency_configs = {}
+#: 新计数先攒这么久再落盘；也是两次处理的最短间隔，提交失败时不会空转。
+FREQUENCY_DEBOUNCE = 60.0
+#: 长等待按墙钟复核：Windows 的等待超时不计睡眠时间，睡醒后最晚这么久补上到期的处理。
+WALL_CLOCK_RECHECK = 3600.0
 TELEMETRY_ITEMS = frozenset({"log", "sessions"})
 MEDIA_STAGES = frozenset({"frame-capture", "frame-tile", "media-probe", "preview", "library-preview"})
 LOCAL_EXCEPTION_TYPES = frozenset({
@@ -127,19 +133,22 @@ def snapshot(config=None):
     config = _config(config)
     current = consent(config)
     return {**{key: current[key] for key in FIELDS},
-            "available": bool(dsn()), "fields": FIELDS, "notice": NOTICE,
+            "available": bool(dsn()),
+            "fields": {key: interface_text.text(f"server:labels.remoteReporting.field.{key}") for key in FIELDS},
+            "field_codes": {key: f"labels.remoteReporting.field.{key}" for key in FIELDS},
+            "notice": interface_text.text(f"server:{NOTICE_CODE}"), "notice_code": NOTICE_CODE,
             "delivery": reporting_delivery.snapshot(config)}
 
 
 def parse_choices(body, *, partial=False):
     if not isinstance(body, dict):
-        raise ValueError("遥测和自动错误诊断必须是布尔值")
+        raise UserValueError("errors.remoteReporting.notBoolean")
     defaults = consent() if partial else {}
     choices = {key: body.get(key, defaults.get(key)) for key in FIELDS}
     if any(type(value) is not bool for value in choices.values()):
-        raise ValueError("遥测和自动错误诊断必须是布尔值")
+        raise UserValueError("errors.remoteReporting.notBoolean")
     if choices["usage"] != choices["errors"]:
-        raise ValueError("版本统计与错误诊断须同时开启或关闭")
+        raise UserValueError("errors.remoteReporting.mustMatch")
     return choices
 
 
@@ -162,12 +171,12 @@ def save(body, config=None):
         except Exception:
             pass
     elif not payload['usage']:
-        global _frequency_timer
+        global _frequency_timer, _frequency_due
         with _lock:
             _frequency_configs.pop(str(config.directory('state')), None)
             if not _frequency_configs and _frequency_timer is not None:
                 _frequency_timer.cancel()
-                _frequency_timer = None
+                _frequency_timer = _frequency_due = None
     return snapshot(config)
 
 
@@ -315,27 +324,48 @@ def _submit(kind, event, config, current, target):
         return accepted
 
 
-def _schedule_frequency(config):
-    global _frequency_timer
+def _wall():
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _next_day():
+    today = datetime.now(timezone.utc).date()
+    return datetime.combine(today + timedelta(days=1), datetime.min.time(), timezone.utc).timestamp()
+
+
+def _arm(due):
+    """在 `_lock` 内调用：定时器排到 `due`，长等待按墙钟分段。"""
+    global _frequency_timer, _frequency_due
+    if _frequency_timer is not None:
+        _frequency_timer.cancel()
+    _frequency_due = due
+    _frequency_timer = threading.Timer(max(0.0, min(due - _wall(), WALL_CLOCK_RECHECK)), _frequency_tick)
+    _frequency_timer.daemon = True
+    _frequency_timer.start()
+
+
+def _schedule_frequency(config, due=None):
+    """登记要定时处理的数据根并排定下次处理；不给时刻表示有新计数，防抖后落盘。只会把定时器提前。"""
     with _lock:
         _frequency_configs[str(config.directory("state"))] = config
-        if _frequency_timer is None:
-            _frequency_timer = threading.Timer(60, _frequency_tick)
-            _frequency_timer.daemon = True
-            _frequency_timer.start()
+        floor = _wall() + FREQUENCY_DEBOUNCE
+        due = floor if due is None else max(due, floor)
+        if _frequency_timer is None or _frequency_due is None or due < _frequency_due:
+            _arm(due)
 
 
 def _frequency_tick():
-    global _frequency_timer
+    global _frequency_timer, _frequency_due
     with _lock:
-        _frequency_timer = None
+        if _frequency_due is not None and _wall() < _frequency_due:
+            _arm(_frequency_due)
+            return
+        _frequency_timer = _frequency_due = None
         configs = list(_frequency_configs.values())
     for config in configs:
         # 常驻托盘与 NAS 不一定每天重启；沿用每日额度，不能只统计启动的那一天。
+        # `usage` 按日界与计数到期点重排下一次。
         usage(config)
-    with _lock:
-        if _frequency_configs and not _disabled:
-            _schedule_frequency(next(iter(_frequency_configs.values())))
 
 
 def _code_location(values):
@@ -367,20 +397,21 @@ def _count_logs(config, current, target):
 
 
 def flush_counts(config=None, *, force=False):
+    """返回计数下一次到期的时刻；没有可处理的计数时返回 None。"""
     try:
         from . import diagnostic_frequency
         config = _config(config)
         target = dsn()
         if _disabled or not target:
-            return
+            return None
         current = _instance_consent(config)
         if not current['errors']:
-            return
-        diagnostic_frequency.flush(config, current["revision"],
+            return None
+        return diagnostic_frequency.flush(config, current["revision"],
             lambda event: _submit("errors", event, config, current, target),
             _count_logs(config, current, target), force=force)
     except Exception:
-        pass
+        return None
 
 
 def send(kind, event, config=None, *, count_only=False):
@@ -425,16 +456,19 @@ def send(kind, event, config=None, *, count_only=False):
 def usage(config=None):
     send("usage", {"message": "Peach daily activity", "level": "info",
                    "tags": {"os": platform.system(), **machine_facts()}}, config)
-    flush_counts(config)
+    due = flush_counts(config)
     try:
         if not _disabled and consent(config)["errors"] and dsn():
-            _schedule_frequency(_config(config))
+            tomorrow = _next_day()
+            _schedule_frequency(_config(config), tomorrow if due is None else min(due, tomorrow))
     except Exception:
         pass
 
 
 def _http_status(error):
-    status = getattr(error, "status_code", None)
+    # 带 code 的报错（`UserFacingError`）身上的 `status_code` 只是「漏到接口层时回什么状态」的提示，
+    # 不是一次 HTTP 失败；按它判 4xx 会把后台技术故障当成预期情况、不再上报。
+    status = None if isinstance(error, UserFacingError) else getattr(error, "status_code", None)
     if type(status) is not int or not 100 <= status <= 599:
         status = getattr(getattr(error, "response", None), "status_code", None)
     if type(status) is not int and any(cls.__module__ == "urllib.error" and cls.__name__ == "HTTPError"
@@ -474,7 +508,7 @@ def _expected_failure(stage, error, fields):
     if kinds & LOCAL_EXCEPTION_TYPES:
         return True
     if ("peach.sources.base", "SourceFailure") in kinds:
-        return str(error.reason) in {"cloudflare_challenge", "ip_banned", "geo_restricted", "auth_required",
+        return str(error.reason) in {"cloudflare_challenge", "ip_banned", "geo_restricted", "account_suspended", "auth_required",
             "not_found", "gone", "no_usable_metadata", "rate_limited", "timeout", "server_error", "network"}
     if ("peach.metadata", "MetadataProviderError") in kinds and error.detail != "parse_error":
         return error.kind in {"auth", "not_found"} or error.retryable is True or error.temporary is True
@@ -621,11 +655,11 @@ def disable_for_process():
 
 
 def close():
-    global _client, _client_dsn, _frequency_timer
+    global _client, _client_dsn, _frequency_timer, _frequency_due
     with _lock:
         if _frequency_timer is not None:
             _frequency_timer.cancel()
-        _frequency_timer = None
+        _frequency_timer = _frequency_due = None
         _frequency_configs.clear()
         if _client is not None:
             _client.close(timeout=0)

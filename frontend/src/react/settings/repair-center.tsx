@@ -11,6 +11,7 @@ import { confirmModal } from '@peach/legacy/ui';
 import { Button } from '@/components/base/buttons/button';
 import { LinkButton } from '@/components/base/buttons/link-button';
 import { apiSend } from '../../api';
+import { withBackoff } from '../../polling';
 import { repairCenterPanelSkeleton } from '../../management-skeletons';
 import { RESULT_PANEL, RESULT_SECTION, SectionHeading } from '../components/fieldset';
 import { Note } from '../components/note';
@@ -38,12 +39,15 @@ const reclaimable = (item: RepairItem) => t('settings:repairCenter.filesAndSize'
 const progressing = (item: RepairItem) => item.state === 'running' && !!item.total;
 /** 页面开着时要跟进的后台进度：在跑的项与还在统计的删除类确认项。补测要跑几天，正因为久才要看得到进度。 */
 const inFlight = (item: RepairItem) => !!item.estimating || item.state === 'running';
+/** 有修复在估算或在跑时每 2 秒读一次，都停了就停；读失败按连续失败次数退避。 */
+export const repairsInterval = withBackoff<RepairCenterData>((data) => (data?.items.some(inFlight) ? 2000 : false));
 
 function reading(item: RepairItem) {
   if (item.estimating) return t('settings:repairCenter.estimating');
   if (item.state === 'failed' && item.error) return item.error;
   // 行里只写体积，手机宽度下才不挤说明列；文件数在确认弹层里点名。
   if (item.files) return t('settings:repairCenter.reclaimable', { size: fmtSize(item.bytes || 0) });
+  if (item.state === 'waiting' && item.backed_up) return t('settings:repairCenter.pendingFixes', { count: item.pending || 0 });
   if (item.state === 'waiting') return item.pending ? t('settings:repairCenter.pendingRecheck', { count: item.pending }) : '';
   if (progressing(item)) return '';
   if (item.total) return `${number(item.done)} / ${number(item.total)}`;
@@ -78,14 +82,21 @@ export function RepairCenterPage() {
   const query = useQuery({
     queryKey: REPAIRS_KEY,
     queryFn: ({ signal }) => fetchRepairs(signal),
-    refetchInterval: ({ state }) => (state.data?.items.some(inFlight) ? 2000 : false),
+    refetchInterval: repairsInterval,
   });
   const data = query.data;
   const action = useAction();
   const update = (next: RepairCenterData) => queryClient.setQueryData(REPAIRS_KEY, next);
   const post = async (item: RepairItem, signal?: AbortSignal) => localizeRepairs(await apiSend<RepairCenterData>(
     `/api/configuration/repairs/${item.id}`, {}, 'POST', signal));
-  const start = (item: RepairItem) => item.files === undefined
+  const start = (item: RepairItem) => item.backed_up
+    ? void confirmModal({
+      title: t('settings:repairCenter.applyTitle', { title: item.title }),
+      body: t('settings:repairCenter.applyBody', { count: item.pending || 0 }),
+      confirmLabel: t('settings:shared.start'),
+      onConfirm: async () => update(await post(item)),
+    })
+    : item.files === undefined
     ? void action.run(item.id, signal => post(item, signal), update)
     : void confirmModal({
       title: t('settings:repairCenter.deleteTitle', { title: item.title }),

@@ -30,7 +30,7 @@ import { CropFrame } from '../crop/crop-frame';
 import { queryClient } from '../query';
 import { busyProps } from '../settings/use-action';
 import {
-  avatarChoicesKey, baseLabel, baseVersion, choiceDetail, choiceFrame, choiceImageUrl, cropNote,
+  avatarChoicesKey, baseLabel, baseVersion, choiceDetail, choicesInterval, choiceFrame, choiceImageUrl, choiceLabel, cropNote,
   fetchAvatarChoices, fetchCodeCover, frameAddress, frameChoice, frameFile, framesItself, indexNote,
   pickerNote, sendAvatarPick, sharedCast,
   type AvatarChoice, type AvatarSubmission,
@@ -111,7 +111,7 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
     // 失败或索引过期时重新读取；有效候选在反复开合时复用。
     retryOnMount: true,
     refetchOnMount: (query) => query.state.data?.index_stale ? 'always' : false,
-    refetchInterval: (query) => query.state.data?.index_refreshing && !query.state.error ? 1000 : false,
+    refetchInterval: choicesInterval,
   });
   /* 换成功之后这一份候选里「在用」是哪一格已经过期，扔掉它，下次点开重新取。要等到弹层
      真的收起来再扔：这时候还有人在读这个键，当场清掉它会立刻再取一遍，白问一趟。 */
@@ -230,7 +230,7 @@ function PickerBody({ kind, entityId, name, onPicked, close }: AvatarPickerProps
                 <ChoiceImage key={imageAttempts[choice.ref] || 0}
                   src={choiceImageUrl(kind, entityId, choice.ref, baseVersion(choice, choice.ref))}
                   choice={choice} onUnavailable={() => setLostChoices(previous => new Set(previous).add(choice.ref))} />
-                <span className="truncate px-1">{choice.label}</span>
+                <span className="truncate px-1">{choiceLabel(choice)}</span>
                 {choice.current
                   ? <span className="absolute top-1 left-1"><Chip variant="caption" color="gray">{t('catalog:avatarPicker.inUse')}</Chip></span>
                   : null}
@@ -350,7 +350,7 @@ function CropStep({ kind, entityId, choice, busy, back, confirm }: {
       <div ref={frame} className="flex min-h-0 flex-1 flex-col items-center gap-4 overflow-y-auto border-t border-separator-border px-5 py-4">
         {src ? (
           <CropFrame src={src} aspect={1} box={box} size={size}
-            label={t('catalog:avatarPicker.cropFrame', { label: choice.label })}
+            label={t('catalog:avatarPicker.cropFrame', { label: choiceLabel(choice) })}
             onSize={(next) => {
               setSize(next);
               /* 这一格自己那张图从取景区里落默认框：检出脸就正好是批处理会截的那一块。

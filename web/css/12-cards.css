@@ -177,7 +177,7 @@ body .card:focus-within{background:var(--hover);box-shadow:0 0 0 8px var(--hover
 .srcbig svg{stroke:currentColor;fill:none;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
 .srcbig.metered{color:var(--meter)}.srcbig.free{color:var(--keep)}
 .meta{display:flex;gap:10px;min-width:0}
-.mav{width:38px;height:38px;border-radius:50%;flex:none;overflow:hidden;background:var(--sunk);
+.mav{width:38px;height:38px;border-radius:50%;flex:none;overflow:hidden;background:var(--media-placeholder);
   position:relative;margin-top:2px;border:0;padding:0;cursor:pointer;color:inherit}
 .mav:hover{box-shadow:0 0 0 2px var(--ink-2)}
 .mav img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
@@ -291,8 +291,6 @@ body[data-density="dense"] .card:not(.feednewcard) .meta .size{flex:none;white-s
 .feedcoverreason{font-size:var(--fs-xs);line-height:1.45;color:var(--muted);display:-webkit-box;-webkit-box-orient:vertical;
   -webkit-line-clamp:3;overflow:hidden;overflow-wrap:anywhere}
 .feedcoverstate button{pointer-events:auto;margin-top:4px}
-/* 正在取那一枚不定进度圆环摆在状态字上面，不带横幅里那份右侧间距。 */
-.feedcoverstate>[role="progressbar"]{margin:0}
 .feednewopen:focus-visible{outline:2px solid var(--tungsten);outline-offset:2px}
 /* 三颗动作键沿用 `.hovertools` 的磨砂圆底，只换尺寸和落点。`.hovertools` 默认
    `pointer-events:none`——那是为了让指针落到底下的预览上，而这三颗是这张卡唯一能按的

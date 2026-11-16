@@ -121,7 +121,7 @@ class DiscoveryMetadataTests(unittest.TestCase):
     def test_source_cooldown_stops_batch_and_preserves_failure(self):
         def unavailable(code):
             self.api.paused_until = self.api.clock() + 900
-            raise PublicSourceUnavailable("资料未取得")
+            raise PublicSourceUnavailable("errors.javdbPublic.unavailable")
         with patch.object(self.api, "movie", side_effect=unavailable) as movie:
             self.cache.ensure(["EXM-001", "EXM-002"])
             self.cache.job.thread.join(5)
@@ -169,6 +169,23 @@ class DiscoveryMetadataTests(unittest.TestCase):
             self.assertEqual(movie.call_count, 3)
             self.assertEqual(movie.call_args.args, ('EXM-001',))
             self.assertEqual(self.cache.peek('EXM-002')[1]['metadata_checked_at'], saved)
+
+    def test_complete_new_work_is_kept_and_pre_release_work_waits_for_release_day(self):
+        self.now[0] = 1791892800.0  # 2026-10-13
+        def movie_for(code):
+            return {'number': code, 'title': 'T', 'cover_url': 'https://c/x.jpg', 'tags': [], 'score': 4,
+                    'duration': 120, 'release_date': '2026-10-10' if code == 'EXM-001' else '2026-10-20'}
+        with patch.object(self.api, 'movie', side_effect=movie_for):
+            self.cache.ensure(['EXM-001', 'EXM-002'])
+            self.cache.job.thread.join(5)
+        restarted = DiscoveryMetadata(self.path, api=self.api, clock=lambda: self.now[0])
+        self.addCleanup(restarted.stop)
+        self.now[0] += 5 * 86400
+        self.assertEqual(restarted._pending_codes(['EXM-001', 'EXM-002'], set(), False), [])
+        self.now[0] += 2 * 86400
+        self.assertEqual(restarted._pending_codes(['EXM-001', 'EXM-002'], set(), False), ['EXM-002'])
+        self.now[0] += 365 * 86400
+        self.assertEqual(restarted.peek('EXM-001')[1]['metadata_state'], 'ready')
 
     def test_source_cache_read_and_failed_refresh_do_not_renew_source_timestamp(self):
         source = {'number': 'EXM-001', 'release_date': '2020-01-01', 'tags': [], 'score': 4, 'duration': 120}

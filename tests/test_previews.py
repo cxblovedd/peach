@@ -23,6 +23,7 @@ from peach.avatar_provider import install_entity_avatar
 from peach.previews import PreviewService, PreviewUnavailable, entity_image_key
 from peach.repository import MediaAsset
 from peach.web_state import WebContract
+from support.stalls import elapsed, stalled_mount
 
 
 class GenerateLockStripingTests(unittest.TestCase):
@@ -388,7 +389,7 @@ class EntityThumbnailTests(unittest.TestCase):
         destination = self.service.thumbnail(self.KEY, self.source)
         original = self.source.read_bytes()
         def deny():
-            raise DiskSpaceDenied('capacity')
+            raise DiskSpaceDenied('errors.storageBudget.cacheWritesStopped', {'reasons': '缓存超限'})
         self.service.capacity_guard = SimpleNamespace(check=deny)
         self.assertEqual(self.service.thumbnail(self.KEY, self.source), destination)
         destination.unlink()
@@ -611,6 +612,23 @@ class ImageSourceGenerationTests(unittest.TestCase):
         self.assertNotEqual(destination.read_bytes(), b'old-thumbnail')
         self.assertEqual(service.cached(1), destination)
 
+    def test_a_stuck_source_answers_within_the_deadline(self):
+        """图片墙一屏几十张：原图所在的盘答不上时，核对当作来源不在、现缩按取不到回，都不挂住请求。"""
+        now = [0.0]
+        service = previews.PhotoThumbnailService(self.root / 'photos', clock=lambda: now[0])
+        destination = service.thumbnail(1, self.source)
+        now[0] += previews.PHOTO_SOURCE_RECHECK
+        other = self.root / 'other' / 'photo.png'
+        other.parent.mkdir()
+        Image.new('RGB', (24, 24), 'blue').save(other)
+        with stalled_mount(self.source, other), mock.patch.object(previews, 'PHOTO_THUMBNAIL_TIMEOUT', 0.2):
+            seconds, cached = elapsed(service.cached, 1)
+            self.assertLess(seconds, 3)
+            self.assertEqual(cached, destination)
+            seconds, result = elapsed(service.thumbnail, 2, other)
+            self.assertLess(seconds, 3)
+            self.assertIsInstance(result, PreviewUnavailable)
+
     def test_signed_photo_cache_remains_available_while_source_is_offline(self):
         now = [0.0]
         service = previews.PhotoThumbnailService(self.root / 'photos', clock=lambda: now[0])
@@ -665,3 +683,20 @@ class ImageSourceGenerationTests(unittest.TestCase):
                         destination = service.path_for('photo')
                 self.assertFalse(destination.exists())
                 self.assertFalse(artifact_rules.current(destination, source=self.source))
+
+
+class UnavailableReasonTests(unittest.TestCase):
+    """取不到图的原因带 code：卡片按 `reason_code` 认是哪一步，英文界面拿到的是英文。"""
+
+    def test_each_reason_keeps_its_protocol_value_and_has_both_languages(self):
+        from peach import interface_text
+        for name, value in previews.REASONS.items():
+            with self.subTest(name=name):
+                error = previews._unavailable(name)
+                self.assertEqual((error.code, error.reason), (f"errors.previews.{name}", value))
+                self.assertTrue(interface_text.has(f"server:{error.code}", "en"))
+        self.assertEqual(interface_text.text("server:errors.previews.snapshotUnavailable", language="en"),
+                         "Preview frame files are missing")
+
+    def test_a_reason_raised_elsewhere_has_no_protocol_value(self):
+        self.assertEqual(PreviewUnavailable("errors.libraryProcessing.ffmpegMissing").reason, "")

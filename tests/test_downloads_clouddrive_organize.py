@@ -13,6 +13,7 @@ from peach.organize_clouddrive import (ACCEPTED, DAV_ORIGIN, REJECTED, MoveNotEx
                                        UnconfirmedMove)
 from peach import organize_clouddrive
 from peach.task_retry import transient_delay
+from peach.os_errors import UserFileNotFoundError
 
 MAPPING = organize_clouddrive.PikPakPaths('A:\\', '/Pikpak')
 
@@ -140,12 +141,21 @@ class ConfiguredPaths(unittest.TestCase):
             credentials.return_value.load.return_value = SimpleNamespace(values={'token': 'test-token'})
             downloads.return_value.load.return_value = SimpleNamespace(clouddrive_address='http://example.test')
             cloud = client.return_value.__enter__.return_value
+            cloud.root = '/'
             cloud.find.return_value = pb.CloudDriveFile(isDirectory=True,
                 CloudAPI=pb.CloudAPI(name='WebDAV', path='/Renamed account'))
             with organize_clouddrive.pikpak_renames('P:\\Library\\a.mp4', roots) as dav:
                 self.assertEqual(dav.url('P:\\Library\\a.mp4'), DAV_ORIGIN + '/Movies/a.mp4')
             cloud.find.assert_called_once_with('/Renamed account/Movies')
             self.assertEqual(headers.call_args.args[2].dav_root, '/Movies')
+
+            cloud.root = '/Renamed account'
+            cloud.find.reset_mock()
+            with self.assertRaises(organize_clouddrive.UserValueError) as raised:
+                with organize_clouddrive.pikpak_renames('P:\\Library\\a.mp4', roots):
+                    pass
+            self.assertEqual(raised.exception.code, 'errors.organizeClouddrive.tokenRootRestricted')
+            cloud.find.assert_not_called()
 
 
 class OfficialMoves(unittest.TestCase):
@@ -169,7 +179,7 @@ class OfficialMoves(unittest.TestCase):
 
     def listing(self, path):
         if path != 'A:\\' and self.entries.get(path) is not True:
-            raise FileNotFoundError('官方父目录未列出所需目录')
+            raise UserFileNotFoundError('errors.organizeClouddrive.cloudParentMissing')
         return [dict(path=name, size=0 if value is True else value, directory=value is True)
                 for name, value in self.entries.items()
                 if name != path and str(PureWindowsPath(name).parent) == path]
@@ -306,7 +316,7 @@ class OfficialMoves(unittest.TestCase):
 
     def test_cache_failure_after_submission_preserves_intent(self):
         self.dav.move_remote = Mock(return_value=ACCEPTED)
-        self.dav.refresh = Mock(side_effect=OSError('未取得'))
+        self.dav.refresh = Mock(side_effect=OSError('connection refused'))
         with self.assertRaises(UnconfirmedMove):
             self.dav.move('A:\\old\\film.mp4', 'A:\\new\\film.mp4')
         self.dav.move_remote.assert_called_once()

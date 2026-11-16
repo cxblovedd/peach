@@ -13,7 +13,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
-from contextlib import closing, redirect_stderr, redirect_stdout
+from contextlib import closing, contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path, PureWindowsPath
 from types import SimpleNamespace
 from unittest import mock
@@ -24,6 +24,8 @@ from peach import follow_image_dims, scripting
 from peach.follow_sources import FollowCandidate, SourceFetch
 from peach.follow_store import FollowStore
 from peach.http import HttpResponse
+from peach.metadata import relayed
+from peach.user_messages import UserOSError
 from peach.migrations import upgrade
 from peach.scan import medium_of
 from support.ledger import fresh_ledger
@@ -374,7 +376,7 @@ class DesktopSmokeTests(unittest.TestCase):
                 self.script.assert_public_resources(application)
 
     def test_cleanup_waits_for_a_released_windows_directory(self):
-        error = PermissionError('目录仍被占用')
+        error = PermissionError('The process cannot access the file because it is being used by another process')
         error.winerror = 32
         directory = mock.Mock()
         directory.cleanup.side_effect = [error, None]
@@ -385,7 +387,7 @@ class DesktopSmokeTests(unittest.TestCase):
     def test_cleanup_preserves_persistent_or_unrelated_failures(self):
         for winerror in (32, 5):
             with self.subTest(winerror=winerror):
-                error = PermissionError('无法清理')
+                error = PermissionError('Access is denied')
                 error.winerror = winerror
                 directory = mock.Mock()
                 directory.cleanup.side_effect = error
@@ -514,7 +516,7 @@ class Sha1SyncOptionsTests(unittest.TestCase):
                     mock.patch.object(self.script, "REVIEW_DIR", root / "review"):
                 args = self.script.parse_args([])
             self.assertEqual(args.cookie_file, root / "secrets" / "115-cookies.txt")
-            self.assertEqual(args.dupes_out, root / "review" / "115-sha1重复.csv")
+            self.assertEqual(args.dupes_out, root / "review" / "115-sha1-duplicates.csv")
             self.assertEqual(args.deprioritize_dir, [])
             self.assertFalse((root / "secrets").exists())
             self.assertFalse((root / "review").exists())
@@ -559,8 +561,8 @@ class Sha1SyncOptionsTests(unittest.TestCase):
                              (1, 1024**3))
             with output.open(encoding=self.script.ENCODING, newline="") as stream:
                 rows = list(csv.DictReader(stream))
-            self.assertEqual([(row["动作"], row["路径"]) for row in rows],
-                             [("保留", r"B:\library\b.mp4"), ("删除", r"B:\incoming\a.mp4")])
+            self.assertEqual([(row["action"], row["path"]) for row in rows],
+                             [("keep", r"B:\library\b.mp4"), ("delete", r"B:\incoming\a.mp4")])
             self.assertEqual(conn.execute("SELECT * FROM asset ORDER BY id").fetchall(), assets)
 
 
@@ -1162,7 +1164,7 @@ class LibraryDirectoryTests(unittest.TestCase):
                     if outcomes[index]:
                         receipt['entries'].append(dict(key=op['key'],status='committed'))
                         return None
-                    error=OSError('不支持该请求');error.winerror=50
+                    error=OSError('The request is not supported');error.winerror=50
                     receipt['failures'].append(dict(key=op['key'],source=op['source'],error=str(error)))
                     return error
                 with mock.patch.object(script,'DATABASE_PATH',ledger),mock.patch.object(script,'OUT',root), \
@@ -1227,7 +1229,7 @@ class LibraryDirectoryTests(unittest.TestCase):
         from peach.organize_clouddrive import MoveNotExecuted
         script = self.script
         def reject(source):
-            raise MoveNotExecuted('官方接口拒绝')
+            raise MoveNotExecuted('errors.organizeClouddrive.moveNotExecuted')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             ledger, translate, calls, operations, patches = self._provider_batch(root, reject)
@@ -1591,7 +1593,7 @@ class OperationalScriptTests(unittest.TestCase):
                 def __init__(self): self.calls = []
                 def query(self, code, source):
                     self.calls.append(code)
-                    raise error("timeout", kind="unavailable",
+                    raise error(*relayed("timeout"), kind="unavailable",
                                 retryable=True, temporary=True)
 
             provider = Flaky()
@@ -1661,7 +1663,7 @@ class OperationalScriptTests(unittest.TestCase):
                     self.calls.append((source, code))
                     if source == "javbus":
                         raise auth_error("javbus", "来源返回 403", status_code=403)
-                    raise error("no such code", kind="not_found")
+                    raise error(*relayed("no such code"), kind="not_found")
 
             provider = Walled()
             health = root / "health.csv"
@@ -1683,7 +1685,11 @@ class OperationalScriptTests(unittest.TestCase):
             self.assertEqual(rows["javbus"]["auth_skips"], "4")
             self.assertEqual(rows["javbus"]["blocked"], "1")
             self.assertEqual(rows["r18dev"]["auth_skips"], "0")
-            self.assertIn("鉴权失败的来源", printed.getvalue())
+            # 控制台跟本机语言（测试固定 zh-CN），日志文件同一句固定英文。
+            self.assertIn("鉴权失败的来源 1 家", printed.getvalue())
+            written = "\n".join(path.read_text(encoding="utf-8") for path in (root / "logs").glob("*.log"))
+            self.assertIn("Sources with failed authentication: 1", written)
+            self.assertIn("  javbus (", written)
 
     def test_only_not_found_counts_as_a_settled_source_verdict(self):
         # 本机配置问题（凭据没贴、桥没装）返回的是 unknown / unavailable 错误。把它当
@@ -1735,7 +1741,7 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertIsNone(backfill.plan_update(
             typed, {"tag_types": {"a": "artist"}, "published_at": None}, None))
 
-        # 写入与续跑：写过的条目在 CSV 里记 `written=是`，下一趟 `--resume` 跳过它。
+        # 写入与续跑：写过的条目在 CSV 里记 `written=yes`，下一趟 `--resume` 跳过它。
         writer = sqlite3.connect(database)
         self.addCleanup(writer.close)
         backfill._apply(writer, [(2, plan)])
@@ -1744,6 +1750,10 @@ class OperationalScriptTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(row), ("2026-05-01T16:32:21Z", 60.054, "exact"))
         out = database.parent / "log.csv"
+        backfill.write_rows(out, backfill.FIELDS, [{"item_id": 2, "written": "yes"},
+                                          {"item_id": 1, "written": "no"}], fill_missing=True)
+        self.assertEqual(backfill.written_ids(out), {2})
+        # 旧版日志写的「是／否」照样认。
         backfill.write_rows(out, backfill.FIELDS, [{"item_id": 2, "written": "是"},
                                           {"item_id": 1, "written": "否"}], fill_missing=True)
         self.assertEqual(backfill.written_ids(out), {2})
@@ -1850,6 +1860,11 @@ class OperationalScriptTests(unittest.TestCase):
                                    "harry potter (harry potter)": "character"}})
         self.assertEqual(json.loads(rows[2]), {"tags": []})
         self.assertEqual(backfill.settled_ids(out), {1})
+        # 旧版日志写的中文取值照样认：写过的与「无需改动」的都算问定。
+        backfill.write_rows(out, backfill.FIELDS, [
+            {"item_id": 1, "result": "取得", "written": "是"}, {"item_id": 2, "result": "无需改动", "written": "否"},
+            {"item_id": 3, "result": "未取得", "written": "否"}], fill_missing=True)
+        self.assertEqual(backfill.settled_ids(out), {1, 2})
 
     def test_rule34_backfill_without_credentials_stops_before_the_backup(self):
         """分类与上传时间要问 dapi，dapi 要账号凭据；缺凭据就在备份与写入之前停。"""
@@ -1966,7 +1981,7 @@ class OperationalScriptTests(unittest.TestCase):
         with out.open(encoding="utf-8", newline="") as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual({(row["external_id"], row["mode"], row["result"]) for row in rows},
-                         {("11", "归档", "取得"), ("21", "探测", "取得"), ("23", "探测", "取得")})
+                         {("11", "archive", "found"), ("21", "probe", "found"), ("23", "probe", "found")})
         self.assertTrue((root / "backup.db").exists())
 
         # 第二遍：全部已有尺寸，没有待补，也不再发请求。
@@ -2042,7 +2057,8 @@ class OperationalScriptTests(unittest.TestCase):
             if not path or not Path(path).exists():
                 continue
             probe = subprocess.run([path, "-c", "uname -s"],
-                                   capture_output=True, text=True, encoding="utf-8", check=False)
+                                   capture_output=True, text=True, encoding="utf-8",
+                                   errors="replace", check=False)
             if probe.returncode == 0 and (sys.platform != "win32" or "linux" not in probe.stdout.casefold()):
                 shells.append(path)
         self.assertTrue(shells)
@@ -2200,7 +2216,7 @@ class OperationalScriptTests(unittest.TestCase):
             plan, scanned = self.find_ads.find_candidates(db, min_group=3)
             self.assertEqual(scanned, 3)
             self.assertEqual(len(plan), 3)
-            self.assertTrue(all("等长重复x3" in row["hits"] for row in plan))
+            self.assertTrue(all("same-length-x3" in row["hits"] for row in plan))
             self.assertFalse((root / "ad-candidates.csv").exists())
 
     def test_ledger_paths_are_split_with_windows_semantics_on_any_host(self):
@@ -2241,9 +2257,9 @@ class OperationalScriptTests(unittest.TestCase):
             plan, scanned = self.find_ads.find_candidates(db, min_group=3)
             self.assertEqual(scanned, 3)
             by_id = {row["id"]: row for row in plan}
-            self.assertIn("推广目录", by_id[1]["hits"])
-            self.assertIn("推广目录", by_id[2]["hits"])
-            self.assertEqual(by_id[1]["confidence"], "确认")
+            self.assertIn("promo-dir", by_id[1]["hits"])
+            self.assertIn("promo-dir", by_id[2]["hits"])
+            self.assertEqual(by_id[1]["confidence"], "confirmed")
             self.assertNotIn(3, by_id)
 
     def test_filename_cleanup_is_conservative(self):
@@ -2519,7 +2535,7 @@ class OperationalScriptTests(unittest.TestCase):
                 self.assertEqual(self.rehome_unknown._direct_children(target), {})
 
     def test_media_batch_scripts_are_import_safe_and_keep_context_rules(self):
-        self.assertEqual(self.probe.context_fields(1920, 1080, 180), ("速食", "横屏", "2K"))
+        self.assertEqual(self.probe.context_fields(1920, 1080, 180), ("quick", "landscape", "1080P"))
         with tempfile.TemporaryDirectory() as tmp:
             output = self.sheets.output_path(Path(tmp), "local", "R:/media/one.mp4")
             self.assertFalse(output.exists())
@@ -2592,16 +2608,26 @@ class OperationalScriptTests(unittest.TestCase):
         responses = iter([HttpResponse(200, {}, gate, "https://brand.test/"),
                           HttpResponse(200, {}, inside, "https://brand.test/top")])
         evidence = []
-        found, final, _ = module.scan(lambda *args: next(responses), "https://brand.test/", 1,
-                                     evidence=evidence)
+        found, final, result, _ = module.scan(lambda *args: next(responses), "https://brand.test/", 1,
+                                             evidence=evidence)
         self.assertEqual(found, {"main_brand", "other_brand"})
+        self.assertEqual(result, "checked")
         self.assertEqual(final, "https://brand.test/top")
         self.assertEqual(len(evidence), 2)
         for response in (HttpResponse(403, {}, inside, "https://brand.test/"),
                          HttpResponse(200, {}, inside, "https://elsewhere.test/")):
-            found, _, note = module.scan(lambda *args, response=response: response, "https://brand.test/", 1)
-            self.assertEqual(found, set())
+            found, _, result, note = module.scan(lambda *args, response=response: response,
+                                                 "https://brand.test/", 1)
+            self.assertEqual((found, result), (set(), "missed"))
             self.assertIn("未取得", note)
+
+    def test_studio_social_resume_rechecks_missed_rows_from_old_and_new_progress_files(self):
+        module = load_script("find_studio_socials")
+        self.assertTrue(module.missed({"result": "missed", "note": ""}))
+        self.assertFalse(module.missed({"result": "checked", "note": "未取得：说明照本机语言写"}))
+        # 旧版进度文件没有 `result` 列，没取到的说明以「未取得」开头。
+        self.assertTrue(module.missed({"note": "未取得：HTTP 403"}))
+        self.assertFalse(module.missed({"note": "官网页面有社交链接"}))
 
     def test_studio_social_ledger_input_includes_existing_socials_and_only_official_sites(self):
         module = load_script("find_studio_socials")
@@ -3255,7 +3281,7 @@ class OperationalScriptTests(unittest.TestCase):
                                 for p in (root / "log").glob("sheets-*.log"))
         self.assertIn("18349", written)
         self.assertIn("duration_mismatch", written)
-        self.assertIn("失败原因：duration_mismatch 1", written)
+        self.assertIn("Failure reasons: duration_mismatch 1", written)
 
     def test_sheets_can_reshoot_one_named_asset_over_a_stale_product(self):
         """点名重抽是为了盖掉上一次的错结果，撞上已存在的产物就短路等于没修。"""
@@ -3862,7 +3888,7 @@ class OperationalScriptTests(unittest.TestCase):
                     self.calls.append((code, source))
                     if source == "javbus" and code == "DEF-002":
                         raise self_error(
-                            "rate limited", kind="rate_limited", status_code=429,
+                            *relayed("rate limited"), kind="rate_limited", status_code=429,
                             retryable=True, temporary=True,
                         )
                     if source == "javbus":
@@ -3922,7 +3948,7 @@ class OperationalScriptTests(unittest.TestCase):
                 def query(self, code, source):
                     self.calls.append((code, source))
                     if code == "LUXU-1642":
-                        raise self_error("status 404", kind="not_found",
+                        raise self_error(*relayed("status 404"), kind="not_found",
                                          status_code=404, retryable=False, temporary=False)
                     return {"source": source, "id": "259LUXU-1642", "maker": "Maan Sha"}
 
@@ -4054,7 +4080,7 @@ class OperationalScriptTests(unittest.TestCase):
                     self.calls.append((code, source))
                     # DEF-002 在 r18.dev 与它兜底的 DMM 都没有，链才走到综合索引那一档。
                     if source == "makers" or (code == "DEF-002" and source in ("r18dev", "dmm")):
-                        raise self_error("status 404", kind="not_found", status_code=404)
+                        raise self_error(*relayed("status 404"), kind="not_found", status_code=404)
                     if code == "DEF-002":
                         return {"source": source, "id": code, "maker": "Studio B"}
                     return OperationalScriptTests._full_payload(code, source)
@@ -4147,7 +4173,7 @@ class OperationalScriptTests(unittest.TestCase):
             self.assertGreaterEqual(auto_apply_metadata(LedgerDatabase(db), candidate_root)["applied"], 1)
             with closing(sqlite3.connect(db)) as con:
                 self.assertEqual(set(con.execute("SELECT tag,source FROM asset_tag WHERE asset_id=1"
-                                                 " AND tag NOT LIKE '演员:%'")),
+                                                 " AND tag NOT LIKE 'performer:%'")),
                                  {("高跟", "javinizer:javdb:tag"), ("丝袜", "javinizer:javdb:tag")})
 
     def test_explicit_sources_ask_every_named_source_and_refuse_retired_names(self):
@@ -4188,17 +4214,17 @@ class OperationalScriptTests(unittest.TestCase):
         from peach.jav_cover_fetch import DeadlineExceeded, NotFound, Unavailable
         from peach.scraping_access import SourcePaused
         translate = self.scrape_codes.translate_failure
-        self.assertEqual((translate("javdb", NotFound("没有")).kind,
-                          translate("javdb", NotFound("没有")).retryable), ("not_found", False))
-        paused = translate("javdb", SourcePaused("来源正在冷却"))
+        self.assertEqual((translate("javdb", NotFound("errors.javdb.notFound")).kind,
+                          translate("javdb", NotFound("errors.javdb.notFound")).retryable), ("not_found", False))
+        paused = translate("javdb", SourcePaused("errors.scrapingAccess.coolingDown"))
         self.assertEqual((paused.kind, paused.status_code, paused.retryable), ("rate_limited", 429, True))
-        walled = translate("javdb", SourcePaused("javdb 返回 403，已冷却"))
+        walled = translate("javdb", SourcePaused(*relayed("HTTP 403")))
         self.assertEqual((walled.kind, walled.status_code, walled.retryable), ("auth", 403, False))
-        self.assertEqual(translate("fc2", DeadlineExceeded("预算用尽")).kind, "timeout")
-        flaky = translate("fc2", Unavailable("HTTP 503 upstream"))
+        self.assertEqual(translate("fc2", DeadlineExceeded("errors.javCoverFetch.deadline")).kind, "timeout")
+        flaky = translate("fc2", Unavailable(*relayed("HTTP 503")))
         self.assertEqual((flaky.kind, flaky.status_code, flaky.temporary), ("unavailable", 503, True))
         # 已经是本脚本分档的错误原样返回，不再套一层。
-        own = self.scrape_codes.MetadataProviderError("x", kind="identity_mismatch")
+        own = self.scrape_codes.MetadataProviderError("errors.base.codeMismatch", kind="identity_mismatch")
         self.assertIs(translate("javdb", own), own)
 
     def test_creator_tag_review_queue_requires_approval_and_backup(self):
@@ -4762,7 +4788,7 @@ class ScriptingConventionTests(unittest.TestCase):
     def test_apply_without_backup_is_refused_with_the_single_house_wording(self):
         with self.assertRaises(SystemExit) as caught:
             scripting.open_for_write(self._args(apply=True))
-        self.assertEqual(str(caught.exception), "--apply 必须同时给 --backup")
+        self.assertEqual(str(caught.exception), "--apply requires --backup")
 
     def test_apply_backup_keeps_transactions_that_are_still_only_in_the_wal(self):
         """WAL 里已提交未 checkpoint 的事务必须进备份；文件复制会把它们丢掉。"""
@@ -4898,8 +4924,10 @@ class R2ArtifactTransferTests(unittest.TestCase):
         path.write_bytes(b"test double; subprocess calls are mocked")
 
     def environment(self):
+        # 清空环境后补回运行器固定的语言，否则报错文字跟系统语言走，英文 CI 上对不上中文断言。
         return {"CI_PROJECT_ID": "123", "CI_PIPELINE_ID": "456", "CI_COMMIT_SHA": "a" * 40,
-                "CI_COMMIT_TAG": "v1.2.3", "CI_COMMIT_REF_PROTECTED": "true", "CI_JOB_ID": "789"}
+                "CI_COMMIT_TAG": "v1.2.3", "CI_COMMIT_REF_PROTECTED": "true", "CI_JOB_ID": "789",
+                "PEACH_LANGUAGE": "zh-CN"}
 
     def rclone_environment(self):
         return {"PEACH_RCLONE": "rclone", "PEACH_R2_BUCKET": "peach-releases"}
@@ -5207,6 +5235,31 @@ class R2ArtifactTransferTests(unittest.TestCase):
             module.identity()
 
 
+class DownloadOnlySmokeCheckoutTests(unittest.TestCase):
+    def test_the_sparse_checkout_carries_every_module_the_smoke_host_imports(self):
+        """仅下载制品验收只稀疏检出几个目录，宿主是没装依赖的 Python。
+
+        0.58.0 的发布演练就断在这里：`build_amane_runtime` 开始读 `peach.interface_text`，检出里没有
+        `src/peach`，三个平台的验收都报 ModuleNotFoundError。按工作流里的清单拷目录，只用标准库导入。
+        """
+        text = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        blocks = re.findall(r"sparse-checkout: \|\n((?:            \S.*\n)+)", text)
+        self.assertGreaterEqual(len(blocks), 2)
+        for block in blocks:
+            folders = [line.strip() for line in block.splitlines()]
+            with self.subTest(folders=folders), tempfile.TemporaryDirectory() as temporary:
+                source = Path(temporary) / "source"
+                for folder in folders:
+                    shutil.copytree(ROOT / folder, source / folder,
+                                    ignore=shutil.ignore_patterns("__pycache__", "node_modules", ".venv"))
+                completed = subprocess.run(
+                    [sys.executable, "-I", "-S", "-c",
+                     "import sys; sys.path.insert(0, sys.argv[1]); import smoke_desktop, build_amane_runtime",
+                     str(source / "scripts")],
+                    capture_output=True, text=True, encoding="utf-8", timeout=60)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
 class R2ReleaseTests(unittest.TestCase):
     def test_publication_preserves_existing_index_and_verifies_published_metadata(self):
         module = load_script("release_r2")
@@ -5417,38 +5470,40 @@ class R2ReleaseTests(unittest.TestCase):
 
 
 class ReleaseDownloadNotesTests(unittest.TestCase):
-    def test_default_download_notes_use_the_github_version_directory(self):
-        from scripts.package_windows_release import DOCS, download_notes
-        links = [url for url in re.findall(r'https://[^\s)]+', download_notes('1.0.0', lite_installer=True))
-                 if not url.startswith(DOCS)]
-        self.assertEqual(len(links), 9)
-        self.assertTrue(all(url.startswith('https://github.com/peach-mitao/peach/releases/download/v1.0.0/')
-                            for url in links))
+    def test_default_download_sections_use_the_github_version_directory(self):
+        from scripts.package_windows_release import DOCS, download_sections
+        for section in download_sections('1.0.0', lite_installer=True):
+            links = {url for url in re.findall(r'https://[^\s)]+', section) if not url.startswith(DOCS)}
+            self.assertEqual(len(links), 9)
+            self.assertTrue(all(url.startswith('https://github.com/peach-mitao/peach/releases/download/v1.0.0/')
+                                for url in links))
 
-    def test_one_download_table_covers_windows_macos_and_docker(self):
-        from scripts.package_windows_release import download_notes
-        table = download_notes('1.0.0', lite_installer=True).split('\n\n')[1]
-        rows = [line.split(' | ')[0].lstrip('| ') for line in table.splitlines()[2:]]
-        self.assertEqual(rows, ['Windows x64'] * 3 + ['macOS Apple Silicon', 'macOS Intel', 'Docker / NAS'])
-        self.assertIn('`longmeidao/peach:1.0.0`', table)
+    def test_each_language_has_one_table_covering_windows_macos_and_docker(self):
+        from scripts.package_windows_release import download_sections
+        english, chinese = download_sections('1.0.0', lite_installer=True)
+        for section, header in ((english, '| Platform | Download'), (chinese, '| 平台 | 下载')):
+            tables = [block for block in section.split('\n\n') if block.startswith(header)]
+            self.assertEqual(len(tables), 1)
+            rows = [line.split(' | ')[0].lstrip('| ') for line in tables[0].splitlines()[2:]]
+            self.assertEqual(rows, ['Windows x64'] * 3 + ['macOS Apple Silicon', 'macOS Intel', 'Docker / NAS'])
+            self.assertIn('`longmeidao/peach:1.0.0`', tables[0])
+        self.assertIsNone(re.search(r'[\u4e00-\u9fff]', english.replace('macos-独立测试包', '')))
 
-    def test_r2_release_notes_link_both_native_platforms_and_tagged_docs(self):
-        from scripts.package_windows_release import download_notes
+    def test_r2_release_notes_point_downloads_at_the_mirror_and_docs_at_the_tag(self):
+        from scripts.package_windows_release import download_sections
         from scripts.publish_gitlab_release import r2_release_notes
-        body = ('### 新增\n\n- **更新**：支持公开下载。\n\n'
-                '[说明](https://github.com/peach-mitao/peach/blob/master/docs/OPERATIONS.md)\n'
-                + download_notes('1.0.0', lite_installer=True))
+        english, chinese = download_sections('1.0.0', lite_installer=True)
+        body = ('### Added\n\n- **Updates**: Public downloads.\n\n'
+                '[Guide](https://github.com/peach-mitao/peach/blob/master/docs/OPERATIONS.md)\n\n' + english + chinese)
         result = r2_release_notes(body, '1.0.0', 'https://downloads.peach.video',
                                   'https://gitgud.io/peach-mitao/peach')
         links = re.findall(r'https://[^\s)]+', result)
-        self.assertIn('### 新增\n\n- **更新**：支持公开下载。', result)
-        self.assertEqual(result.count('## 下载选择'), 1)
+        self.assertIn('### Added\n\n- **Updates**: Public downloads.', result)
         self.assertEqual(links[0], 'https://gitgud.io/peach-mitao/peach/-/blob/v1.0.0/docs/OPERATIONS.md')
-        downloads = [url for url in links[1:] if '/docs/' not in url]
+        self.assertNotIn('github.com/peach-mitao/peach/releases/download', result)
+        downloads = {url for url in links[1:] if '/docs/' not in url}
         self.assertEqual(len(downloads), 9)
         self.assertTrue(all(url.startswith('https://downloads.peach.video/v1.0.0/') for url in downloads))
-        self.assertIn('https://downloads.peach.video/v1.0.0/Peach-1.0.0-macos-arm64.dmg', links)
-        self.assertIn('https://downloads.peach.video/v1.0.0/Peach-1.0.0-macos-x86_64.dmg', links)
 
 
 class GitGudPackageMirrorTests(unittest.TestCase):
@@ -5519,7 +5574,9 @@ class GitGudPackageMirrorTests(unittest.TestCase):
         response.__enter__.return_value.read.return_value = json.dumps(release).encode()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
-            (root / 'RELEASE_NOTES.md').write_text('### 新增\n\n- 下载。\n', encoding='utf-8')
+            (root / 'RELEASE_NOTES.md').write_text(
+                '### Added\n\n- Downloads.\n\n[Installer](https://github.com/peach-mitao/peach/releases/download/'
+                'v1.2.3/Peach-1.2.3-windows-x64-setup.exe)\n', encoding='utf-8')
             with mock.patch.dict(os.environ, {'CI_COMMIT_TAG': 'v1.2.3', 'CI_COMMIT_SHA': sha,
                     'CI_PROJECT_URL': 'https://gitgud.io/owner/repo', 'PEACH_DOWNLOAD_BACKEND': 'both',
                     'PEACH_R2_PUBLIC_BASE': 'https://downloads.example'}), \
@@ -5537,6 +5594,95 @@ class GitGudPackageMirrorTests(unittest.TestCase):
             self.assertEqual(links[1], backup)
             self.assertIn('https://downloads.example/v1.2.3/',
                           (root / 'RELEASE_NOTES.md').read_text(encoding='utf-8'))
+
+    def test_gitgud_backup_stores_signed_sums_unchanged_and_links_packages(self):
+        from scripts import publish_gitlab_release as module
+        sha = '1' * 40
+        asset = {'name': 'app.zip', 'size': 3, 'sha256': 'a' * 64}
+        link = {'name': 'app.zip · GitGud', 'url': 'https://gitgud.io/package/app.zip',
+                'link_type': 'package', 'direct_asset_path': '/gitgud/app.zip'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / 'RELEASE_NOTES.md').write_text('### Added\n\n- Backup.\n', encoding='utf-8')
+            signed = [root / 'SHA256SUMS.txt', root / 'SHA256SUMS.txt.sig']
+            signed[0].write_bytes(b'a' * 64 + b'  app.zip\n')
+            signed[1].write_bytes(b'signature bytes')
+            with mock.patch.dict(os.environ, {'CI_COMMIT_TAG': 'v1.2.3', 'CI_COMMIT_SHA': sha,
+                    'CI_PROJECT_URL': 'https://gitgud.io/owner/repo', 'PEACH_DOWNLOAD_BACKEND': 'gitgud'}), \
+                    mock.patch.object(module.subprocess, 'check_output', return_value=sha), \
+                    mock.patch.object(module.subprocess, 'run') as run, \
+                    mock.patch('scripts.release_r2.inventory', return_value=[asset]), \
+                    mock.patch('scripts.release_r2.release_sums', return_value=signed) as sums, \
+                    mock.patch.object(module, 'gitgud_package_links', return_value=[link]) as mirror:
+                module.publish(root)
+            sums.assert_called_once_with(root, [asset], root)
+            mirrored = mirror.call_args.args[1]['assets']
+            self.assertEqual([item['name'] for item in mirrored], ['app.zip', 'SHA256SUMS.txt', 'SHA256SUMS.txt.sig'])
+            self.assertEqual(mirrored[2]['sha256'], hashlib.sha256(b'signature bytes').hexdigest())
+            command = run.call_args.args[0]
+            self.assertEqual(json.loads(command[command.index('--assets-links') + 1]), [link])
+            self.assertNotIn('--use-package-registry', command)
+
+    @staticmethod
+    def github_release(files):
+        assets = [{'name': name, 'size': len(body), 'browser_download_url': 'https://github.example/' + name,
+                   'digest': 'sha256:' + hashlib.sha256(body).hexdigest()} for name, body in files.items()]
+        bodies = {asset['browser_download_url']: body for asset, body in zip(assets, files.values())}
+
+        @contextmanager
+        def client(**_options):
+            session = mock.MagicMock()
+
+            @contextmanager
+            def stream(_method, url, headers=None):
+                response = mock.MagicMock()
+                response.iter_bytes.return_value = [bodies[url]]
+                yield response
+            session.stream.side_effect = stream
+            yield session
+        return json.dumps({'assets': assets}).encode(), client
+
+    def test_github_release_download_keeps_artifacts_and_signed_sums_checked_against_github_digests(self):
+        from scripts import publish_gitlab_release as module
+        files = {'app.zip': b'zip', 'Setup.exe': b'exe', 'SHA256SUMS.txt': b'sums', 'SHA256SUMS.txt.sig': b'sig',
+                 'appcast.xml': b'feed'}
+        listing, client = self.github_release(files)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(module, 'read_url', return_value=listing), \
+                    mock.patch.object(module, 'http_client', client):
+                names = module.download_github_release('v1.2.3', root)
+            self.assertEqual(names, ['app.zip', 'Setup.exe', 'SHA256SUMS.txt', 'SHA256SUMS.txt.sig'])
+            self.assertEqual((root / 'SHA256SUMS.txt.sig').read_bytes(), b'sig')
+            self.assertFalse((root / 'appcast.xml').exists())
+
+    def test_github_release_download_stops_when_bytes_differ_from_the_github_digest(self):
+        from scripts import publish_gitlab_release as module
+        listing, client = self.github_release({'app.zip': b'zip'})
+        tampered = json.loads(listing)
+        tampered['assets'][0]['digest'] = 'sha256:' + '0' * 64
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(module, 'read_url', return_value=json.dumps(tampered).encode()), \
+                    mock.patch.object(module, 'http_client', client), self.assertRaises(ValueError):
+                module.download_github_release('v1.2.3', Path(directory))
+
+    def test_backup_from_github_publishes_the_downloaded_tag_through_the_gitgud_backend(self):
+        from scripts import publish_gitlab_release as module
+        sha = '2' * 40
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {}, clear=False):
+            root = Path(directory)
+            with mock.patch.object(module, 'download_github_release') as download, \
+                    mock.patch.object(module.subprocess, 'run') as run, \
+                    mock.patch.object(module.subprocess, 'check_output', return_value=sha + '\n'), \
+                    mock.patch.object(module, 'publish') as publish:
+                module.backup_from_github('v1.2.3', root)
+                environment = {key: os.environ[key] for key in ('CI_COMMIT_TAG', 'CI_COMMIT_SHA', 'PEACH_DOWNLOAD_BACKEND')}
+            download.assert_called_once_with('v1.2.3', root)
+            self.assertEqual(run.call_args.args[0][1:], ['scripts/changelog.py', '--notes', '1.2.3',
+                                                         '--to', str(root / 'RELEASE_NOTES.md')])
+            self.assertEqual(environment, {'CI_COMMIT_TAG': 'v1.2.3', 'CI_COMMIT_SHA': sha,
+                                           'PEACH_DOWNLOAD_BACKEND': 'gitgud'})
+            publish.assert_called_once_with(root)
 
 
 class MainlineScopeTests(unittest.TestCase):
@@ -5585,7 +5731,7 @@ class MainlineScopeTests(unittest.TestCase):
         self.git(root, "checkout", "-q", "master")
 
         def unavailable(_environ):
-            raise OSError("外部请求未取得（ConnectError）")
+            raise UserOSError("errors.peachProxy.requestFailed", {"kind": "ConnectError"})
         for name, pipelines in (("首次推送", []), ("强推后旧提交不是祖先", [{"sha": rewritten, "status": "success"}]),
                                 ("克隆里没有这个提交", [{"sha": "f" * 40, "status": "success"}]),
                                 ("只有本提交自己", [{"sha": head, "status": "success"}]),
@@ -5903,7 +6049,7 @@ class ReleaseTagTests(unittest.TestCase):
         with self._shell(), \
                 mock.patch.object(self.release, "api", return_value={"object": {"sha": "abc"}}), \
                 mock.patch.object(self.release.version_bump, "read_version", return_value="0.7.14"), \
-                mock.patch.object(Path, "read_text", return_value="# 变更日志\n\n## [未发布]\n"), \
+                mock.patch.object(Path, "read_text", return_value="# Changelog\n\n## [Unreleased]\n"), \
                 self.assertRaisesRegex(ValueError, "CHANGELOG.md 缺少 0.7.14"):
             self.release.plan("owner/repo")
 
@@ -5968,7 +6114,7 @@ class PinnedReleaseTests(unittest.TestCase):
     """标签、说明与 CI 都绑定已确认的提交，主线可以继续推进。"""
 
     SHA = "1" * 40
-    NOTES = "## [0.37.0] - 2026-10-01\n\n### 修复\n\n- **界面**：统计页布局稳定。\n"
+    NOTES = "## [0.37.0] - 2026-10-01\n\n### Fixed / 修复\n\n- **Interface**: Stats layout holds. / **界面**：统计页布局稳定。\n"
 
     @classmethod
     def setUpClass(cls):
@@ -6036,8 +6182,8 @@ class PinnedReleaseTests(unittest.TestCase):
             {("git", "branch", "--show-current"): "feature"},
             {("git", "rev-parse", f"{self.SHA}^{{commit}}"): "2" * 40},
             {("git", "show", f"{self.SHA}:src/peach/__init__.py"): ""},
-            {("git", "show", f"{self.SHA}:CHANGELOG.md"): "## [未发布]\n"},
-            {("git", "show", f"{self.SHA}:CHANGELOG.md"): self.NOTES.replace("**界面**：", "web：")},
+            {("git", "show", f"{self.SHA}:CHANGELOG.md"): "## [Unreleased]\n"},
+            {("git", "show", f"{self.SHA}:CHANGELOG.md"): self.NOTES.replace("**Interface**: Stats layout holds. / **界面**：", "web：")},
             {("git", "tag", "--list", "v0.37.0"): "v0.37.0"},
         ]
         for changes in cases:
@@ -6138,7 +6284,7 @@ class ShipTests(unittest.TestCase):
     def _version(self):
         return mock.patch.object(self.release.version_bump, "read_version", return_value="0.8.0")
 
-    def _document(self, text="## [0.8.0] - 2026-09-07\n\n### 新增\n\n- **界面**：那件事\n"):
+    def _document(self, text="## [0.8.0] - 2026-09-07\n\n### Added / 新增\n\n- **Interface**: That thing. / **界面**：那件事\n"):
         return mock.patch.object(Path, "read_text", return_value=text)
 
     @staticmethod
@@ -6209,12 +6355,12 @@ class ShipTests(unittest.TestCase):
 
     def test_a_version_without_its_changelog_section_cannot_ship(self):
         with self._shell(), self._api(), self._version(), \
-                self._document("# 变更日志\n\n## [未发布]\n"), \
+                self._document("# Changelog\n\n## [Unreleased]\n"), \
                 self.assertRaisesRegex(ValueError, "缺少 0.8.0"):
             self.release.ship("owner/repo", apply=True)
 
     def test_an_unclassified_release_note_cannot_be_committed(self):
-        raw = "## [0.8.0] - 2026-09-07\n\n### 修复\n\n- web：那件事\n"
+        raw = "## [0.8.0] - 2026-09-07\n\n### Fixed / 修复\n\n- web：那件事\n"
         with self._shell() as command, self._api(), self._version(), self._document(raw), \
                 self.assertRaisesRegex(self.release.version_bump.VersionError, "未归类.*web"):
             self.release.ship("owner/repo", apply=True)
@@ -6543,7 +6689,7 @@ class Fc2SellerAndDescriptiveNameRepairTests(unittest.TestCase):
             con.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(?,?,?,?)",
                         (asset_id, entity_id, role, source))
         con.execute("INSERT INTO asset_tag(asset_id,tag,confidence,source) VALUES(11,?,0.6,?)",
-                    ("演员:145cm色白お嬢様", "javinizer:javdb:performer"))
+                    ("performer:145cm色白お嬢様", "javinizer:javdb:performer"))
         con.execute("INSERT INTO entity_alias(entity_id,alias,normalized_alias,source,confidence)"
                     " VALUES(3,'色白お嬢様','色白お嬢様','test',1.0)")
         con.execute("INSERT INTO review_decision(category,item_key,status,reviewer,note,updated_at)"

@@ -2,7 +2,8 @@
 
 每个 `--apply` 脚本与 `peach migrate` 都在写入前留一份完整备份，每份和账本一样大
 （一百多 MB）。备份的价值只在「这次写入被复核之前」，之后它就是一份没人会再读的旧账本。
-三条规则任一成立就留：最近 `KEEP_RECENT` 份之内、还没满 `MIN_AGE`、或者比当前账本更新
+三条规则任一成立就留：最近 `KEEP_RECENT` 份之内（Peach 配置里能改，存在本机的
+`retention_settings`）、还没满 `MIN_AGE`、或者比当前账本更新
 （正常不会出现，出现了说明有事没弄清，先别删）。三条都不成立才删，连同 `-wal`／`-shm`
 一起删。当前账本 `integrity_check` 不是 `ok` 时拒绝清退任何一份：那正是要回滚的时候。
 
@@ -40,6 +41,7 @@ from . import interface_text
 from .fsutil import atomic_write_text
 from .migrations import plan as migration_plan, sqlite_backup, upgrade as migration_upgrade
 from .task_stages import stage as stage_fields
+from .user_messages import UserFacingError, nested_message
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +82,7 @@ _held_lock = threading.Lock()
 class BackupPlan:
     keep: tuple[Path, ...]
     remove: tuple[Path, ...]
-    refused: str | None = None   # 不为 None 时一份都不删，这里写原因
+    refused: dict | None = None  # 不为 None 时一份都不删，这里写原因（一句带 code 的话 `{code, params}`）
     removable_bytes: int = 0     # 算计划时量好，删完文件就量不到了
     orphans: tuple[Path, ...] = ()   # 主文件已不在的 `-wal`／`-shm`，和 remove 一起删
 
@@ -114,7 +116,7 @@ def organize_backup(live: Path, generated_root: Path | str, name: str) -> Iterat
     清退失败只记日志：少删几份旧备份不能让这次整理失败。
     """
     if not ORGANIZE_PATTERN.match(name):
-        raise ValueError(f"整理备份文件名不合规则：{name}")
+        raise ValueError(f"organize backup name does not match the pattern: {name}")
     backup = organize_dir(generated_root) / name
     sqlite_backup(live, backup)
     with holding(backup):
@@ -122,7 +124,7 @@ def organize_backup(live: Path, generated_root: Path | str, name: str) -> Iterat
             prune(live, apply=True, directory=backup.parent, pattern=ORGANIZE_PATTERN,
                   keep_recent=ORGANIZE_KEEP_RECENT, min_age=ORGANIZE_MIN_AGE)
         except Exception:
-            log.warning("整理备份清退失败", exc_info=True)
+            log.warning("Organize backup retention cleanup failed", exc_info=True)
         yield backup
 
 
@@ -162,20 +164,22 @@ def orphan_sidecars(directory: Path, pattern: re.Pattern[str] = BACKUP_PATTERN) 
     return sorted(found)
 
 
-def integrity(db: Path, *, foreign_keys: bool = False) -> str:
+def integrity(db: Path, *, foreign_keys: bool = False) -> str | dict:
+    """`"ok"`，或者没通过的原因：SQLite `integrity_check` 的原文，或一句带 code 的话 `{code, params}`
+    （打不开、外键失效、检查出错）。两种都能直接作为报错的参数。"""
     try:
         connection = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     except sqlite3.Error as exc:
-        return f"无法打开：{exc}"
+        return {"code": "labels.ledgerBackups.integrity.openFailed", "params": {"error": str(exc)}}
     try:
         result = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
         if result == 'ok' and foreign_keys:
             broken = connection.execute('PRAGMA foreign_key_check').fetchall()
             if broken:
-                return f'外键检查发现 {len(broken)} 条失效引用'
+                return {"code": "labels.ledgerBackups.integrity.foreignKeys", "params": {"count": len(broken)}}
         return result
     except sqlite3.Error as exc:
-        return f"检查失败：{exc}"
+        return {"code": "labels.ledgerBackups.integrity.checkFailed", "params": {"error": str(exc)}}
     finally:
         connection.close()
 
@@ -205,10 +209,11 @@ def plan(
     if not backups and not orphans:
         return BackupPlan((), ())
     if not live.is_file():
-        return BackupPlan(tuple(backups), (), "当前数据库不存在，不清退任何备份")
+        return BackupPlan(tuple(backups), (), {"code": "labels.ledgerBackups.refused.ledgerMissing"})
     check = integrity(live)
     if check != "ok":
-        return BackupPlan(tuple(backups), (), f"当前数据库 integrity_check 不是 ok：{check}")
+        return BackupPlan(tuple(backups), (), {"code": "labels.ledgerBackups.refused.integrity",
+                                               "params": {"check": check}})
     moment = now or datetime.now()
     live_mtime = _live_mtime(live)
     recent = set(backups[-keep_recent:]) if keep_recent > 0 else set()
@@ -249,7 +254,7 @@ def prune(
         try:
             target.unlink(missing_ok=True)
         except OSError as exc:
-            log.warning("数据库备份未能删除 %s: %s", target, exc)
+            log.warning("Failed to delete database backup %s: %s", target, exc)
     return decided
 
 
@@ -257,7 +262,7 @@ def prune(
 # 手动备份与从备份恢复（ADR-0138）
 
 
-class BackupRejected(ValueError):
+class BackupRejected(UserFacingError, ValueError):
     """这份备份或这次恢复不能做，原因写给人看；账本没有被改动。"""
 
 
@@ -294,13 +299,14 @@ def _copy(live: Path, destination: Path, progress, stage: str) -> None:
         connection.execute("PRAGMA journal_mode=DELETE")
 
 
-def create(live: Path, *, purpose: str = MANUAL_PURPOSE, progress=None, now: datetime | None = None) -> Path:
+def create(live: Path, *, purpose: str = MANUAL_PURPOSE, progress=None, now: datetime | None = None,
+           keep_recent: int = KEEP_RECENT) -> Path:
     """写一份整库备份：先写 `.part`，完整性检查通过才改成正式文件名，再按保留规则清退。
 
     `.part` 不合 `BACKUP_PATTERN`，列表与清退都看不见它；没通过检查的那份当场删掉。
     """
     if not live.is_file():
-        raise BackupRejected("账本不存在")
+        raise BackupRejected("errors.ledgerBackups.ledgerMissing")
     target = _free_name(live.parent, purpose, now)
     part = target.with_name(target.name + PART_SUFFIX)
     try:
@@ -309,14 +315,14 @@ def create(live: Path, *, purpose: str = MANUAL_PURPOSE, progress=None, now: dat
             progress(**stage_fields('backup.checkIntegrity'))
         check = integrity(part)
         if check != "ok":
-            raise BackupRejected(f"备份没有通过完整性检查：{check}")
+            raise BackupRejected("errors.ledgerBackups.backupIntegrityFailed", {"check": check})
         part.replace(target)
     finally:
         _unlink_all(part)
     try:
-        prune(live, apply=True)
+        prune(live, apply=True, keep_recent=keep_recent)
     except Exception:
-        log.warning("账本备份清退失败", exc_info=True)
+        log.warning("Ledger backup retention cleanup failed", exc_info=True)
     return target
 
 
@@ -359,10 +365,10 @@ def resolve(live: Path, organize_directory: Path, ident: object) -> Path:
     directory, pattern = {"database": (live.parent, BACKUP_PATTERN),
                           "organize": (organize_directory, ORGANIZE_PATTERN)}.get(location, (None, None))
     if directory is None or not pattern.match(name) or Path(name).name != name:
-        raise BackupRejected("请选择列表里的一份备份")
+        raise BackupRejected("errors.ledgerBackups.chooseBackup")
     path = directory / name
     if not path.is_file():
-        raise BackupRejected("这份备份已经不在了，请刷新列表")
+        raise BackupRejected("errors.ledgerBackups.backupGone")
     return path
 
 
@@ -395,7 +401,7 @@ def _record(live: Path, **fields) -> dict:
     try:
         atomic_write_text(live.with_name(RESULT_NAME), json.dumps(data, ensure_ascii=False))
     except OSError:
-        log.warning("账本恢复结果未能写入", exc_info=True)
+        log.warning("Failed to write the ledger restore result", exc_info=True)
     return data
 
 
@@ -467,7 +473,7 @@ def _carry_operational(live: Path, saved: Path) -> None:
 
 
 def restore(live: Path, backup: Path, *, migrations_dir: Path, progress=None,
-            now: datetime | None = None) -> RestoreOutcome:
+            now: datetime | None = None, keep_recent: int = KEEP_RECENT) -> RestoreOutcome:
     """用 `backup` 替换当前账本。
 
     顺序是先查后动：备份完整性 → 复制到暂存 → 迁到当前结构 → 暂存完整性；全部通过才另存当前
@@ -478,7 +484,7 @@ def restore(live: Path, backup: Path, *, migrations_dir: Path, progress=None,
     report(**stage_fields('backup.checkIntegrity'))
     check = integrity(backup)
     if check != "ok":
-        raise BackupRejected(f"这份备份没有通过完整性检查：{check}")
+        raise BackupRejected("errors.ledgerBackups.thisBackupIntegrityFailed", {"check": check})
     staging = _staging(live)
     _unlink_all(staging)
     try:
@@ -486,16 +492,16 @@ def restore(live: Path, backup: Path, *, migrations_dir: Path, progress=None,
         try:
             _, pending = migration_plan(staging, migrations_dir)
         except RuntimeError as exc:
-            raise BackupRejected(f"这份备份的结构与当前程序不符：{exc}") from exc
+            raise BackupRejected("errors.ledgerBackups.schemaMismatch", {"error": str(exc)}) from exc
         if pending:
             report(**stage_fields('backup.migrateBackup'))
             migration_upgrade(staging, migrations_dir)
         check = integrity(staging, foreign_keys=True)
         if check != "ok":
-            raise BackupRejected(f"备份迁到当前结构后没有通过完整性检查：{check}")
+            raise BackupRejected("errors.ledgerBackups.migratedIntegrityFailed", {"check": check})
         healthy = live.is_file() and integrity(live) == "ok"
         if healthy and _page_size(live) != _page_size(staging):
-            raise BackupRejected("这份备份的页面大小与当前账本不同，不能在服务运行时恢复")
+            raise BackupRejected("errors.ledgerBackups.pageSizeMismatch")
         report(**stage_fields('backup.saveCurrent'))
         saved = None
         if live.is_file():
@@ -504,7 +510,7 @@ def restore(live: Path, backup: Path, *, migrations_dir: Path, progress=None,
                 _copy(live, saved, progress, "backup.saveCurrent")
                 if integrity(saved) != "ok":
                     _unlink_all(saved)
-                    raise BackupRejected("当前账本另存后没有通过完整性检查，没有恢复")
+                    raise BackupRejected("errors.ledgerBackups.savedCopyIntegrityFailed")
             else:
                 # 坏账本 SQLite 未必读得出来，按文件原样留一份，连同 `-wal`。
                 for suffix in ("", "-wal"):
@@ -526,28 +532,36 @@ def restore(live: Path, backup: Path, *, migrations_dir: Path, progress=None,
                 _replace_file(staging, live)
             check = integrity(live, foreign_keys=True)
             if check != "ok":
-                raise BackupRejected(f"恢复后的账本没有通过完整性检查：{check}")
+                raise BackupRejected("errors.ledgerBackups.restoredIntegrityFailed", {"check": check})
         except Exception as exc:
-            settled = settle(live, reason=f"恢复没有完成（{exc}）", state="failed")
-            raise BackupRejected(settled["message"]) from exc
+            settled = settle(live, reason={"code": "labels.ledgerBackups.settle.restoreIncomplete",
+                                           "params": {"error": nested_message(exc)}}, state="failed")
+            raise BackupRejected("errors.ledgerBackups.restoreSettled", {
+                "message": {"code": settled["message_code"], "params": settled["message_params"]}}) from exc
         if healthy and saved is not None:
             try:
                 _carry_operational(live, saved)
             except sqlite3.Error:
-                log.warning("恢复后未能接回任务历史与账本版本号", exc_info=True)
+                log.warning("Failed to reattach task history and the ledger version after restore", exc_info=True)
         marker.unlink(missing_ok=True)
         live.with_name(RESULT_NAME).unlink(missing_ok=True)
     finally:
         _unlink_all(staging)
     try:
-        prune(live, apply=True)
+        prune(live, apply=True, keep_recent=keep_recent)
     except Exception:
-        log.warning("账本备份清退失败", exc_info=True)
+        log.warning("Ledger backup retention cleanup failed", exc_info=True)
     return RestoreOutcome(backup, saved, tuple(migration.version for migration in pending))
 
 
-def settle(live: Path, *, reason: str = "上次从备份恢复被中断", state: str = "interrupted") -> dict:
+#: 恢复中断后由启动时收拾的原因。
+INTERRUPTED = {"code": "labels.ledgerBackups.settle.interrupted"}
+
+
+def settle(live: Path, *, reason: dict = INTERRUPTED, state: str = "interrupted") -> dict:
     """恢复留下了标记却没走完时，把账本收拾到一个确定的状态，并记下结果。
+
+    `reason` 是一句带 code 的话；结果的 `message` 是 zh-CN 原文，旁边带 `message_code`、`message_params`。
 
     启动时（服务与 `peach migrate upgrade` 打开账本之前）调用，恢复中途出错时也调用。依次：
     当前账本完整就留着它；不完整或不在了，用暂存里迁好的备份补完这次恢复；暂存也不能用，就退回
@@ -562,11 +576,9 @@ def settle(live: Path, *, reason: str = "上次从备份恢复被中断", state:
     staging = _staging(live)
     if live.is_file() and integrity(live) == "ok":
         outcome = "kept"
-        message = f"{reason}；当前账本完整性检查通过，保持不变"
     elif staging.is_file() and integrity(staging) == "ok":
         _replace_file(staging, live)
         outcome = "completed"
-        message = f"{reason}；已用迁好的备份完成恢复"
     elif saved is not None and saved.is_file() and integrity(saved) == "ok":
         if live.is_file():
             try:
@@ -576,18 +588,25 @@ def settle(live: Path, *, reason: str = "上次从备份恢复被中断", state:
         else:
             shutil.copy2(saved, live)
         outcome = "rolled-back"
-        message = f"{reason}；已退回恢复前的账本"
     else:
         outcome = "unresolved"
-        message = f"{reason}；当前账本和恢复前的另存都没有通过完整性检查，请从备份列表另选一份恢复"
+    code = SETTLED[outcome]
+    params: dict = {"reason": reason}
     if saved is not None and outcome != "rolled-back":
-        message += f"，恢复前的账本另存在 {saved.name}"
+        code, params = "labels.ledgerBackups.settle.savedAs", {"message": {"code": code, "params": params},
+                                                                "name": saved.name}
     _unlink_all(staging)
-    result = _record(live, state=state, outcome=outcome, message=message,
-                     backup=Path(data.get("backup") or "").name)
+    result = _record(live, state=state, outcome=outcome, message=interface_text.text(f"server:{code}", params),
+                     message_code=code, message_params=params, backup=Path(data.get("backup") or "").name)
     marker.unlink(missing_ok=True)
-    log.warning("账本恢复标记处理：%s", message)
+    log.warning("Ledger restore marker processed: %s", outcome)
     return result
+
+
+#: 收拾结果的说明，按结局分。
+SETTLED = {"kept": "labels.ledgerBackups.settle.kept", "completed": "labels.ledgerBackups.settle.completed",
+           "rolled-back": "labels.ledgerBackups.settle.rolledBack",
+           "unresolved": "labels.ledgerBackups.settle.unresolved"}
 
 
 def recover(live: Path) -> dict | None:
@@ -616,29 +635,40 @@ class LedgerBackups:
         self.lock = threading.Lock()
         self._restoring = self.restore_job
 
+    def keep_recent(self) -> int:
+        from .retention_settings import backup_keep
+        return backup_keep(self.config.directory("state"))
+
     def _busy(self) -> bool:
         return any((job.snapshot() or {}).get("status") == "running"
                    for job in (self.backup_job, self._restoring))
 
     def snapshot(self) -> dict:
         from .runtime_prepare import configured_ledger_writer
-        writer, reason = configured_ledger_writer(self.config)
+        writer, reason = configured_ledger_writer(self.config, language=None)
+        explained = {}
+        if not writer and interface_text.nested(reason):
+            explained = {"writer_reason": interface_text.text(f"server:{reason['code']}", reason.get("params")),
+                         "writer_reason_code": reason["code"], "writer_reason_params": reason.get("params", {})}
+        elif not writer:
+            explained = {"writer_reason": str(reason)}
         return {
             "backups": catalog(self.live, self.organize),
             "backup": self.backup_job.snapshot() or {"status": "idle"},
             "restore": self._restoring.snapshot() or {"status": "idle"},
-            "writer": writer, "writer_reason": "" if writer else reason,
+            "writer": writer, "writer_reason": "", **explained,
             "last_restore": read_result(self.live),
         }
 
     def start_backup(self) -> dict:
         with self.lock:
             if self._busy():
-                raise BackupRejected("备份或恢复正在进行，请等它完成")
+                raise BackupRejected("errors.ledgerBackups.busy")
             job = self.backup_job
 
             def work(identity):
-                path = create(self.live, progress=lambda **values: job.update(identity, **values))
+                path = create(self.live, progress=lambda **values: job.update(identity, **values),
+                              keep_recent=self.keep_recent())
                 job.update(identity, status="complete", **stage_fields('backup.backupDone'), name=path.name,
                            bytes=path.stat().st_size)
 
@@ -649,39 +679,41 @@ class LedgerBackups:
         from .health import inspect_database
         from .runtime_prepare import configured_ledger_writer
         from . import update_tasks
-        writer, reason = configured_ledger_writer(self.config)
+        writer, reason = configured_ledger_writer(self.config, language=None)
         if not writer:
-            raise BackupRejected(f"只有写入端能恢复账本：{reason}")
+            raise BackupRejected("errors.ledgerBackups.writerOnly", {"reason": reason})
         backup = resolve(self.live, self.organize, ident)
         readable = bool(inspect_database(self.live, self.migrations_dir)["readable"])
         with self.lock:
             if self._busy():
-                raise BackupRejected("备份或恢复正在进行，请等它完成")
+                raise BackupRejected("errors.ledgerBackups.busy")
             busy = update_tasks.running(self.live, task_rows=readable)
             if busy:
-                raise BackupRejected(f"还有后台任务在运行：{'、'.join(busy)}。请等它们结束或停止后再恢复")
+                raise BackupRejected("errors.ledgerBackups.tasksRunning", {"tasks": list(busy)})
             job = self.restore_job if readable else self.offline_restore
             self._restoring = job
             migrations_dir = self.migrations_dir
 
             def work(identity):
                 from .config import MIGRATIONS_DIR
-                token = update_tasks.reserve(self.live, busy="正在从备份恢复账本，暂时不能启动新任务。")
+                token = update_tasks.reserve(self.live, busy="errors.ledgerBackups.restoringBusy")
                 try:
                     own_files, own_runs = job.registration(identity)
                     late = update_tasks.running(self.live, own_files=own_files, own_runs=own_runs,
                                                 task_rows=readable)
                     if late:
-                        raise BackupRejected(f"还有后台任务在运行：{'、'.join(late)}。没有恢复")
+                        raise BackupRejected("errors.ledgerBackups.tasksRunningNotRestored",
+                                             {"tasks": list(late)})
                     outcome = restore(self.live, backup, migrations_dir=migrations_dir or MIGRATIONS_DIR,
-                                      progress=lambda **values: job.update(identity, **values))
+                                      progress=lambda **values: job.update(identity, **values),
+                                      keep_recent=self.keep_recent())
                 finally:
                     update_tasks.release(self.live, token)
                 if self.after_restore is not None:
                     try:
                         self.after_restore()
                     except Exception:
-                        log.warning("恢复后清理缓存失败", exc_info=True)
+                        log.warning("Failed to clear caches after restore", exc_info=True)
                 job.update(identity, status="complete", **stage_fields('backup.restoreDone'), backup=backup.name,
                            saved=outcome.saved.name if outcome.saved else "",
                            migrated=len(outcome.migrated))

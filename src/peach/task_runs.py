@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
-from . import interface_text, task_stages
+from . import interface_text, task_outcomes, task_stages
 from .jobs import TaskRunConflict, process_alive, process_matches
 from .repository import LedgerDatabase
 
@@ -76,6 +76,9 @@ FINISH_RETRY_DELAYS = (1.0, 5.0)
 #: 每个 task_key 默认保留多少条终态记录。活动页只看最近几轮，更早的属于日志。
 DEFAULT_KEEP = 20
 
+#: 失败与中断的后继行按结束时间保留这么多天，见 `prune` 的 `failed_days`。
+FAILED_FOLLOWUP_DAYS = 30
+
 #: 一轮任务最多能派出多少条后继（ADR-0040 第五条）。多出来的在入队时截断，截断了几条
 #: 写进父任务的摘要——静默丢弃和无上限一样，都是事后查不出来的那一类。
 #: 64 是「一部片的出演者加厂牌」那个量级的十几倍，正常扇出撞不到它。
@@ -93,7 +96,7 @@ TASK_KEYS = (
     "jav-discovery-metadata", "diagnostic-export", "ledger-backup", "ledger-restore", "upgrade-repairs",
     "upgrade-library", "follow-evidence-reclaim", "organize", "batch", "scrape-codes", "jav-covers",
     "entity-avatar", "performer-profile", "performer-alias", "studio-mark", "creator-identity", "code-samples",
-    "feed-check", "feed-scrape", "feed-cover", "want-scrape", "timeline-thumbnails", "download-postprocess",
+    "feed-check", "feed-scrape", "feed-cover", "want-scrape", "want-search", "timeline-thumbnails", "download-postprocess",
     "seed-import", "follow-creator", "amane-bridge", "source-check", "face-models",
 )
 
@@ -107,13 +110,14 @@ def trigger_label(trigger: str) -> str:
     return interface_text.label(f"manage:taskTrigger.{trigger}", trigger)
 
 
-#: 落库的进度说明与结束原因（ADR-0156 第三条）的键：文字在 `server.json` 的 `taskRun.progress.*`、
-#: `taskRun.error.*`。`progress_label` / `error` 存按 zh-CN 渲染的一句，code 与参数存进旁边的列。
+#: 落库的进度说明与结束原因（ADR-0159 第二条）的键：文字在 `server.json` 的 `taskRun.progress.*`、
+#: `taskRun.error.*`。带 code 的那一句只存 code 与参数，`progress_label` / `error` 列留空，读出时
+#: 按资源渲染；没有 code 的那一句（文件名、异常原文）照旧存原文。
 #: `{{task}}`、`{{trigger}}`、`{{stage}}` 不进参数：库里只有 `task_key`、触发方式的 id 与阶段 code，
 #: 读的一方按界面语言换成名字。
 PROGRESS_KEYS = ("item", "items", "downloadLanded", "batch", "subjectStage", "videosStage",
-                 "waitingForUpdate", "waitingForService", "pausedWaiting")
-ERROR_KEYS = ("skippedBy", "skipped", "interrupted", "unknownFollowup")
+                 "waitingForUpdate", "waitingForService", "pausedWaiting", "schedulingRepairs")
+ERROR_KEYS = ("skippedBy", "skipped", "interrupted", "unknownFollowup", "dispatchInterrupted", "stoppedEarly")
 
 
 def _fill(key: str, task_key: str, params: dict) -> str:
@@ -123,6 +127,16 @@ def _fill(key: str, task_key: str, params: dict) -> str:
     if "stage" in params:
         names["stage"] = task_stages.text(str(params["stage"]))
     return interface_text.text(f"server:{key}", {**params, **names})
+
+
+def coded_text(code: str, params: dict, task_key: str = "") -> str:
+    """库里一句带 code 的说明按资源渲染。阶段名的 code 是 `stage.<阶段>`；只说任务名的条目说明
+    （`item_progress` 不带条目名）渲染成任务名。"""
+    if code.startswith("stage."):
+        return task_stages.text(code.removeprefix("stage."))
+    if code == "taskRun.progress.item" and not params.get("name"):
+        return task_label(task_key)
+    return _fill(code, task_key, params)
 
 
 def run_progress(key: str, task_key: str = "", **params) -> dict:
@@ -150,6 +164,20 @@ def _coded(code: str | None, params: dict | None) -> tuple[str | None, str | Non
     return code, json.dumps(params or {}, ensure_ascii=False)
 
 
+def _text(text: str | None, code: str | None) -> str | None:
+    """原文那一列：带 code 的那句不存文字，读出时按资源渲染。"""
+    return None if code else text
+
+
+def _render(text: str | None, code: str | None, params: dict, task_key: str) -> str:
+    if code:
+        try:
+            return coded_text(code, params, task_key)
+        except (KeyError, TypeError, interface_text.InterfaceTextMissing):
+            LOGGER.warning("task_run text code %s has no resource entry", code)
+    return text or ""
+
+
 def _params(raw: str | None) -> dict:
     try:
         value = json.loads(raw or "{}")
@@ -162,6 +190,13 @@ def stamp(moment: datetime | None = None) -> str:
     """ISO-8601 UTC 文本，与 `entity`、`follow_schedule` 同一种写法。"""
     return (moment or datetime.now(timezone.utc)).astimezone(
         timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _delete_runs(connection, where: str, params) -> int:
+    """删掉满足 `where` 的运行行：下载任务指向它们的链接先清空，状态本身保留。"""
+    connection.execute("UPDATE download_task SET postprocess_run_id=NULL WHERE postprocess_run_id IN ("
+                       f"SELECT id FROM task_run WHERE {where})", params)
+    return connection.execute(f"DELETE FROM task_run WHERE {where}", params).rowcount
 
 
 def _parse(value: str | None) -> datetime | None:
@@ -235,7 +270,7 @@ class TaskRun:
             "progress_label": self.progress_label,
             "progress_code": self.progress_code,
             "progress_params": self.progress_params,
-            "result_summary": self.result_summary,
+            "result_summary": task_outcomes.rendered(self.result_summary),
             "error": self.error,
             "error_code": self.error_code,
             "error_params": self.error_params,
@@ -257,20 +292,23 @@ def _row(row: sqlite3.Row) -> TaskRun:
         summary = json.loads(row["result_summary"] or "{}")
     except ValueError:
         summary = {}
+    task_key = row["task_key"]
+    progress_code, progress_params = row["progress_code"] or "", _params(row["progress_params"])
+    error_code, error_params = row["error_code"] or "", _params(row["error_params"])
     return TaskRun(
-        id=row["id"], task_key=row["task_key"], trigger=row["trigger"],
+        id=row["id"], task_key=task_key, trigger=row["trigger"],
         status=row["status"], mutex_key=row["mutex_key"], pid=row["pid"],
         host=row["host"] or "", started_at=row["started_at"],
         finished_at=row["finished_at"], heartbeat_at=row["heartbeat_at"],
         progress_current=row["progress_current"], progress_total=row["progress_total"],
-        progress_label=row["progress_label"] or "",
+        progress_label=_render(row["progress_label"], progress_code, progress_params, task_key),
         result_summary=summary if isinstance(summary, dict) else {},
-        error=row["error"] or "",
+        error=_render(row["error"], error_code, error_params, task_key),
         parent_run_id=row["parent_run_id"], root_run_id=row["root_run_id"],
         followup_key=row["followup_key"] or "",
         followup_depth=int(row["followup_depth"] or 0),
-        progress_code=row["progress_code"] or "", progress_params=_params(row["progress_params"]),
-        error_code=row["error_code"] or "", error_params=_params(row["error_params"]),
+        progress_code=progress_code, progress_params=progress_params,
+        error_code=error_code, error_params=error_params,
     )
 
 
@@ -337,7 +375,7 @@ class TaskRunStore:
             connection.execute(
                 "UPDATE task_run SET status='pending',pid=0,progress_label=?,progress_code=?,"
                 "progress_params=?,result_summary=? WHERE id=? AND status='running'",
-                (label, *_coded(code, params),
+                (_text(label, code), *_coded(code, params),
                  json.dumps({'paused_for_update': True} if paused_for_update else {}), run_id))
 
     def _resume(self, run_id, task_key):
@@ -364,9 +402,9 @@ class TaskRunStore:
         `conflict="raise"` 是手动触发的语义：告诉用户是哪一轮挡着，让他自己决定。
         """
         if trigger not in TRIGGERS:
-            raise ValueError(f"未知的触发方式：{trigger}")
+            raise ValueError(f"unknown trigger: {trigger}")
         if conflict not in ("skip", "raise"):
-            raise ValueError(f"未知的冲突处理方式：{conflict}")
+            raise ValueError(f"unknown conflict mode: {conflict}")
         if not self.enabled:
             return None
         moment = stamp()
@@ -378,11 +416,11 @@ class TaskRunStore:
                     "progress_label,progress_code,progress_params,result_summary) "
                     "VALUES(?,?,'running',?,?,?,?,?,0,?,?,?,?,?)",
                     (task_key, trigger, mutex_key, pid if pid is not None else os.getpid(),
-                     self.host, moment, moment, total, label, *_coded(code, params),
+                     self.host, moment, moment, total, _text(label, code), *_coded(code, params),
                      json.dumps(summary or {}, ensure_ascii=False)))
                 run_id = int(cursor.lastrowid)
                 from .task_control import initialize_speed
-                initialize_speed(self, run_id)
+                initialize_speed(self, run_id, task_key=task_key)
         except sqlite3.IntegrityError:
             if mutex_key is None:
                 # 没声明互斥还撞上约束，说明坏的是别的东西（CHECK、列约束），
@@ -411,7 +449,7 @@ class TaskRunStore:
                 "finished_at,result_summary,error,error_code,error_params) "
                 "VALUES(?,?,'cancelled',?,?,?,?,?,?,?,?)",
                 (task_key, trigger, mutex_key, os.getpid(), self.host, stamp(), summary,
-                 reason["error"], *_coded(reason["error_code"], reason["error_params"])))
+                 None, *_coded(reason["error_code"], reason["error_params"])))
 
     def progress(self, run_id: int | None, *, current: int | None = None,
                  total: int | None = None, label: str | None = None,
@@ -433,14 +471,13 @@ class TaskRunStore:
         assignments = ["heartbeat_at=?"]
         values: list[object] = [stamp()]
         for column, value in (("progress_current", current),
-                              ("progress_total", total),
-                              ("progress_label", label)):
+                              ("progress_total", total)):
             if value is not None:
                 assignments.append(f"{column}=?")
                 values.append(value)
         if label is not None:
-            assignments += ["progress_code=?", "progress_params=?"]
-            values += _coded(code, params)
+            assignments += ["progress_label=?", "progress_code=?", "progress_params=?"]
+            values += [_text(label, code), *_coded(code, params)]
         return self._update_progress(run_id, assignments, values)
 
     def heartbeat(self, run_id: int | None, *,
@@ -460,7 +497,7 @@ class TaskRunStore:
                 first = run_id not in self._progress_failing
                 self._progress_failing.add(run_id)
             if first:
-                LOGGER.warning("第 %s 轮的进度没写进 task_run，下一次进度再写：%s",
+                LOGGER.warning("Progress for run %s was not written to task_run, will retry with the next update: %s",
                                run_id, error)
             return False
         with self._lock:
@@ -478,15 +515,16 @@ class TaskRunStore:
         写锁拿不到时按 `finish_retry_delays` 重试，全部用完仍写不进去才抛。
         """
         if status not in TERMINAL_STATUSES:
-            raise ValueError(f"{status} 不是终态")
+            raise ValueError(f"{status} is not a terminal status")
         if not self.enabled or run_id is None:
             return False
         moment = stamp()
         assignments = ["status=?", "finished_at=?", "heartbeat_at=?", "result_summary=?",
                        "error=?", "error_code=?", "error_params=?"]
+        coded = error_code if error else None
         values = [status, moment, moment,
-                  json.dumps(summary or {}, ensure_ascii=False), error,
-                  *_coded(error_code if error else None, error_params)]
+                  json.dumps(summary or {}, ensure_ascii=False), _text(error, coded),
+                  *_coded(coded, error_params)]
         delays = list(self.finish_retry_delays)
         while True:
             try:
@@ -496,7 +534,7 @@ class TaskRunStore:
                 if not delays:
                     raise
                 delay = delays.pop(0)
-                LOGGER.warning("第 %s 轮结算没写进 task_run，%s 秒后重试：%s",
+                LOGGER.warning("Settlement for run %s was not written to task_run, retrying in %s s: %s",
                                run_id, delay, failure)
                 time.sleep(delay)
         with self._lock:
@@ -530,7 +568,7 @@ class TaskRunStore:
             result["depth_exceeded"] = len(items)
             return result
         seen: set[str] = set()
-        planned: list[tuple[str, str, str, str | None, str | None]] = []
+        planned: list[tuple[str, str, str | None, str | None, str | None]] = []
         for item in items:
             key, task_key, label, code, params = (*item, None, None)[:5]
             key = str(key).strip()
@@ -538,7 +576,7 @@ class TaskRunStore:
                 result["duplicates"] += 1
                 continue
             seen.add(key)
-            planned.append((key, str(task_key), str(label or ""), *_coded(code, params)))
+            planned.append((key, str(task_key), _text(str(label or ""), code), *_coded(code, params)))
         if len(planned) > MAX_FOLLOWUPS:
             result["truncated"] = len(planned) - MAX_FOLLOWUPS
             planned = planned[:MAX_FOLLOWUPS]
@@ -591,7 +629,7 @@ class TaskRunStore:
                     "parent_run_id,root_run_id,followup_key,followup_depth) "
                     "VALUES(?,?,'pending',?,?,?,?,?,?,?,'{}',?,?,?,?)",
                     (run.task_key, run.trigger, run.followup_key, os.getpid(), self.host,
-                     stamp(), waiting["label"], *_coded(waiting["code"], waiting["params"]),
+                     stamp(), None, *_coded(waiting["code"], waiting["params"]),
                      run.parent_run_id, run.root_run_id, run.followup_key, run.followup_depth))
             except sqlite3.IntegrityError:
                 return None
@@ -752,13 +790,17 @@ class TaskRunStore:
                 recovered.append(run.id)
         return recovered
 
-    def prune(self, task_key: str, keep: int = DEFAULT_KEEP, *, keep_errors: bool = False) -> int:
+    def prune(self, task_key: str, keep: int = DEFAULT_KEEP, *, keep_errors: bool = False,
+              failed_days: float | None = FAILED_FOLLOWUP_DAYS) -> int:
         """每个 task_key 只留最近 `keep` 条终态记录，返回删掉多少条。
 
         活跃任务保留，指向已清退历史的父任务和根任务关联由删除触发器置空。
         随后清退整个数据根里已结束运行的控制文件（`task_control.prune_controls`），不限本 task_key。
-        后继使用 `keep_errors` 保留仍可重试的失败项；下载状态保留并清空已清退运行的链接。
-        阈值用 `LIMIT 1 OFFSET keep` 取「第 keep+1 新的那条 id」。
+        后继使用 `keep_errors`：成功与取消的按 `keep` 条清退；失败与中断的不占条数，按结束时间
+        保留 `failed_days` 天，过了就清退。重试不读这一行——下载按自己的后处理状态重派，
+        升级补修按 `ledger_upgrade_item`——它只供任务中心里看最近出过什么错。`failed_days`
+        为 None 时失败行全留，交给类型自己按结论清退（`FollowupType.prunes_failures`）。
+        下载状态保留并清空已清退运行的链接。阈值用 `LIMIT 1 OFFSET keep` 取「第 keep+1 新的那条 id」。
         """
         if not self.enabled or keep < 0:
             return 0
@@ -770,14 +812,32 @@ class TaskRunStore:
                 f"SELECT id FROM task_run WHERE task_key=? AND status IN ({marks}) "
                 "ORDER BY id DESC LIMIT 1 OFFSET ?", (task_key, keep)).fetchone()
             if threshold is not None:
-                connection.execute(
-                    "UPDATE download_task SET postprocess_run_id=NULL WHERE postprocess_run_id IN ("
-                    f"SELECT id FROM task_run WHERE task_key=? AND status IN ({marks}) AND id<=?)",
-                    (task_key, threshold["id"]))
-                cursor = connection.execute(
-                    f"DELETE FROM task_run WHERE task_key=? AND status IN ({marks}) "
-                    "AND id<=?", (task_key, threshold["id"]))
-                removed = cursor.rowcount
+                removed = _delete_runs(connection, f"task_key=? AND status IN ({marks}) AND id<=?",
+                                       (task_key, threshold["id"]))
+            if keep_errors and failed_days is not None:
+                cutoff = stamp(datetime.now(timezone.utc) - timedelta(days=failed_days))
+                removed += _delete_runs(
+                    connection, "task_key=? AND status IN ('failed','interrupted') "
+                    "AND followup_key IS NOT NULL AND finished_at<?", (task_key, cutoff))
+        from .task_control import prune_controls
+        prune_controls(self)
+        return removed
+
+    def delete_finished(self, run_ids) -> int:
+        """删掉这几行已结束的运行（活跃的不碰），收走它们的控制文件，返回删掉的行数。
+
+        给按自己的结论清退失败后继的调用方（`upgrade_repairs.prune_settled_failures`）。
+        """
+        ids = sorted({int(run_id) for run_id in run_ids})
+        if not self.enabled or not ids:
+            return 0
+        removed = 0
+        terminal = ",".join(f"'{name}'" for name in TERMINAL_STATUSES)
+        with self.database.write_transaction(notify=False) as connection:
+            for offset in range(0, len(ids), 900):
+                batch = ids[offset:offset + 900]
+                removed += _delete_runs(
+                    connection, f"status IN ({terminal}) AND id IN ({','.join('?' * len(batch))})", batch)
         from .task_control import prune_controls
         prune_controls(self)
         return removed
@@ -856,7 +916,7 @@ class TaskRunStore:
             clauses.append("status IN (%s)" % ",".join(f"'{s}'" for s in TERMINAL_STATUSES))
         elif status:
             if status not in (*ACTIVE_STATUSES, *TERMINAL_STATUSES):
-                raise ValueError(f"未知的状态：{status}")
+                raise ValueError(f"unknown status: {status}")
             clauses.append("status=?")
             values.append(status)
         if task_key:
@@ -986,8 +1046,9 @@ class TaskRunStore:
                 checkpoint()
         except BaseException as error:
             from .task_control import Cancelled
+            from .user_messages import failure_fields
             handle.finish('cancelled' if isinstance(error, Cancelled) else 'failed',
-                          error='' if isinstance(error, Cancelled) else f"{type(error).__name__}: {error}")
+                          **({} if isinstance(error, Cancelled) else failure_fields(error)))
             raise
         else:
             handle.finish("succeeded")
@@ -1020,7 +1081,7 @@ def cli_run(task_key: str, db_path: Path | str | None, *, label: str = "",
             candidate.query(limit=1)
             store = candidate
         except sqlite3.OperationalError:
-            print(f"[task-run] {db_path} 没有 task_run 表，本趟不登记进任务中心")
+            print(f"[task-run] {db_path} has no task_run table; this run is not recorded in the task center")
     if store is None:
         yield TaskRunHandle(TaskRunStore(Path(db_path or ":memory:"), enabled=False), None)
         return

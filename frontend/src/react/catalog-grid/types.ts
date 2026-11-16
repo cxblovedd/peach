@@ -2,6 +2,7 @@
  * 条目与分页的形状以 `/api/items`（`src/peach/web_router.py`）为准。 */
 
 import type { FaceRef } from '@peach/card-art';
+import type { TextPart } from '../../core/server-text';
 /** 卡片署名行上一个实体的引用：头像取图与取景都从这里来。 */
 export interface MediaEntityRef extends FaceRef { id: number }
 
@@ -47,6 +48,8 @@ export interface MediaItem {
   creator_entity?: MediaEntityRef | null;
   studio?: string;
   why?: string;
+  /** `why` 按「 · 」拆开的每一条理由的 code（`/api/related`）；没有就照原文显示。 */
+  why_codes?: string[];
   /** 接着看：与当前作品共有的标签，稀有的在前（`/api/related`）。 */
   why_tags?: string[];
   feedback?: string;
@@ -54,9 +57,11 @@ export interface MediaItem {
   disposal_reason?: 'manual' | 'junk' | 'duplicate' | 'missing' | null;
   watch_later?: boolean;
   part_group?: {
-    key: string; seed_id: number; count: number; title?: string; total_size?: number; total_duration?: number;
+    key: string; seed_id: number; count: number; title?: string; title_code?: string; total_size?: number;
+    total_duration?: number;
   } | null;
-  edition_group?: { key: string; seed_id: number; count: number; editions: string[] } | null;
+  /** 同番号的几个版本。`editions` 是 zh-CN 原文，同序的 `editions_parts` 按段给当前语言拼。 */
+  edition_group?: { key: string; seed_id: number; count: number; editions: string[]; editions_parts?: TextPart[][] } | null;
   [field: string]: unknown;
 }
 
@@ -151,6 +156,8 @@ export interface CatalogGridProps {
   mix?: boolean;
   /** 每接一页插一条竖屏带。 */
   shorts?: boolean;
+  /** 竖屏带一条放几张（设置页那一项）；缺省 `SHORTS_BATCH`。 */
+  shortsLimit?: number;
   /** 每接一页报一次：总数与此刻显示的卡数（Mix 与竖屏带不算）。壳据此推筛选条的读数、重画批量条，
    *  回收站把读数写在说明行上。 */
   onCount?(total: number, shown: number): void;

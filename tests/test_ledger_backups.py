@@ -6,13 +6,14 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from peach import ledger_backups, migrations, settings_file, update_tasks, web_organize
+from peach import ledger_backups, migrations, retention_settings, settings_file, update_tasks, web_organize
 from peach.task_runs import TaskRunStore
 from support.ledger import MIGRATIONS_DIR, fresh_ledger
 
@@ -622,6 +623,19 @@ class LedgerBackupManagerTests(unittest.TestCase):
             return [row[0] for row in connection.execute(
                 "SELECT status FROM task_run WHERE task_key = ? ORDER BY id", (task_key,))]
 
+    def test_a_manual_backup_prunes_down_to_the_count_kept_on_this_computer(self):
+        retention_settings.save(self.config.directory("state"), {"backup_keep": 2})
+        old = time.time() - 3 * 86400
+        for day in range(1, 5):
+            path = self.root / "database" / f"ledger.pre-migrate-2026010{day}-000000.db"
+            path.write_bytes(b"old")
+            os.utime(path, (old + day, old + day))
+        self.manager.start_backup()
+        state = self.finish(self.manager.backup_job)
+        self.assertEqual(state["status"], "complete", state)
+        self.assertEqual(sorted(path.name for path in (self.root / "database").glob("ledger.pre-*.db")),
+                         sorted(["ledger.pre-migrate-20260104-000000.db", state["name"]]))
+
     def test_backup_and_restore_run_as_background_tasks_in_the_task_center(self):
         self.manager.start_backup()
         state = self.finish(self.manager.backup_job)
@@ -656,7 +670,7 @@ class LedgerBackupManagerTests(unittest.TestCase):
                 self.manager.start_restore(f"database/{backup.name}")
 
     def test_new_tasks_are_held_off_while_restoring(self):
-        token = update_tasks.reserve(self.live, busy="正在从备份恢复账本，暂时不能启动新任务。")
+        token = update_tasks.reserve(self.live, busy="errors.ledgerBackups.restoringBusy")
         self.addCleanup(update_tasks.release, self.live, token)
         with self.assertRaisesRegex(update_tasks.UpdateBusy, "正在从备份恢复账本"):
             with update_tasks.admission(self.live):
@@ -679,9 +693,14 @@ class LedgerBackupManagerTests(unittest.TestCase):
             missing = client.post("/api/configuration/ledger-backups/restore",
                                   json={"id": "database/ledger.pre-manual-1.db", "confirm": True})
             self.assertEqual(missing.status_code, 409)
-            self.assertIn("已经不在", missing.json()["detail"])
+            self.assertIn("已经不在", missing.json()["detail"]["message"])
             self.assertEqual(client.post("/api/configuration/ledger-backups/backup",
                                          headers={"origin": "https://other.invalid"}).status_code, 403)
+            self.assertEqual(client.get("/api/configuration/retention").json(), {"backup_keep": 5, "log_days": 183})
+            self.assertEqual(client.post("/api/configuration/retention", json={"log_days": 7}).status_code, 400)
+            self.assertEqual(client.post("/api/configuration/retention", json={"backup_keep": 10}).json(),
+                             {"backup_keep": 10, "log_days": 183})
+            self.assertEqual(self.manager.keep_recent(), 10)
 
 
 if __name__ == "__main__":

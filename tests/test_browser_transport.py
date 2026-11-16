@@ -6,6 +6,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -347,7 +348,7 @@ class BrowserTransportTests(unittest.TestCase):
         self.assertEqual(bounds, [{"windowState": "normal"}, {"left": 200, "top": 100, "width": 1000, "height": 800},
                                   {"windowState": "minimized"}], "先放回屏幕内，过了再收起")
         self.assertIn("Page.bringToFront", [method for method, _ in server.calls])
-        self.assertEqual(attention_seen[0], ["fc2ppv-db.com 的人机验证需要点一下，浏览器窗口已打开"])
+        self.assertEqual(attention_seen[0], ["fc2ppv-db.com verification needs a click; the browser window is open"])
         self.assertEqual(browser_transport.attention(), [], "过了就撤回提醒")
 
     def test_minimizing_the_offscreen_window_on_a_challenge_brings_it_on_screen(self):
@@ -386,7 +387,7 @@ class BrowserTransportTests(unittest.TestCase):
                           if method in ("Browser.setWindowBounds", "Browser.getWindowBounds")}, {7})
         self.assertFalse(any(method == "Network.deleteCookies" for method, _ in server.calls),
                          "用户已经在看，不再等 15 秒清 cookie")
-        self.assertEqual(attention_seen[0], ["javten.com 的人机验证需要点一下，浏览器窗口已打开"])
+        self.assertEqual(attention_seen[0], ["javten.com verification needs a click; the browser window is open"])
         self.assertEqual(browser_transport.attention(), [])
 
     def test_a_window_put_away_by_peach_is_not_taken_for_a_user_summons(self):
@@ -466,7 +467,7 @@ class BrowserTransportTests(unittest.TestCase):
         started = self.clock.now
         with self.assertRaises(ChallengeUnsolved) as caught:
             transport(request, 10, 4096)
-        self.assertIn("不再弹", str(caught.exception))
+        self.assertIn("not shown again", str(caught.exception))
         self.assertLessEqual(self.clock.now - started, 56, "不弹窗就只等清 cookie 那 15 秒加自动时限，不再多等点击那 120 秒")
         self.assertEqual(window_shows(server), 1, "弹过一次没点过去，这次不弹")
         self.assertEqual(browser_transport.attention(), [])
@@ -665,6 +666,59 @@ class WebSocketTests(unittest.TestCase):
             with self.assertRaises(RuntimeError) as caught:
                 ws.call("Page.navigate", url="about:blank")
         self.assertIn("no target", str(caught.exception))
+
+
+    def test_a_page_that_keeps_sending_events_cannot_hold_a_call_past_its_deadline(self):
+        """回包永远不到、事件却一直推来：期限按整次调用算，到期抛超时并丢掉这条连接。"""
+        server = ChattyCdp()
+        self.addCleanup(server.close)
+        ws = _WebSocket(f"ws://127.0.0.1:{server.port}/devtools/page/T1")
+        self.addCleanup(ws.close)
+        outcome = []
+
+        def call():
+            try:
+                ws.call("Page.enable", timeout=0.5)
+            except Exception as error:
+                outcome.append(error)
+        worker = threading.Thread(target=call, daemon=True)
+        started = time.monotonic()
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(), "调用一直挂着")
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertIsInstance(outcome[0], TimeoutError)
+        with self.assertRaises(OSError):
+            ws.sock.recv(1)
+
+
+class ChattyCdp(FakeCdp):
+    """握手后每 50 毫秒推一条事件，从不回答命令。"""
+
+    def __init__(self):
+        super().__init__(lambda method, params: {})
+
+    def serve(self, connection: socket.socket):
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = connection.recv(4096)
+            if not chunk:
+                return
+            head += chunk
+        request = head.split(b"\r\n\r\n", 1)[0]
+        key = next(line.split(b":", 1)[1].strip() for line in request.split(b"\r\n") if line.lower().startswith(b"sec-websocket-key"))
+        accept = base64.b64encode(hashlib.sha1(key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
+        connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                           b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
+        event = json.dumps({"method": "Network.dataReceived", "params": {}}).encode()
+        try:
+            for _ in range(200):
+                connection.sendall(bytes([0x81, len(event)]) + event)
+                time.sleep(0.05)
+        except OSError:
+            pass
+        finally:
+            connection.close()
 
 
 class BrowserLookupTests(unittest.TestCase):
