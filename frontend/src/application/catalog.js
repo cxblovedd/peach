@@ -90,6 +90,10 @@ function openCardDetails(it,anchor){
 }
 
 export async function toggleWatchLater(it,onChange){
+  const before = !!it.watch_later;
+  const next = !before;
+  it.watch_later = next;
+  onChange(next);
   try{
     const r=await api('/api/watch-later',{method:'POST',body:JSON.stringify({id:it.id})});
     it.watch_later=r.watch_later;onChange(!!r.watch_later);
@@ -97,7 +101,11 @@ export async function toggleWatchLater(it,onChange){
       const restored=await api('/api/watch-later',{method:'POST',body:JSON.stringify({id:it.id})});
       it.watch_later=restored.watch_later;onChange(!!restored.watch_later);
     }});
-  }catch(error){receiptsState.actionFailure(tr('shell:watchLater.updateAction'),error)}
+  }catch(error){
+    it.watch_later=before;
+    onChange(before);
+    receiptsState.actionFailure(tr('shell:watchLater.updateAction'),error);
+  }
 }
 
 export async function runResourceOperation(it,operation){
