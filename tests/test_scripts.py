@@ -20,7 +20,7 @@ from unittest import mock
 
 from datetime import datetime, timezone
 
-from peach import follow_image_dims, scripting
+from peach import follow_backfill, follow_image_dims, scripting
 from peach.follow_sources import FollowCandidate, SourceFetch
 from peach.follow_store import FollowStore
 from peach.http import HttpResponse
@@ -1699,10 +1699,12 @@ class OperationalScriptTests(unittest.TestCase):
     def test_rule34_detail_backfill_reuses_the_connector_and_is_resumable(self):
         """标签类型、上传时间要另问 dapi，视频时长在原文件头里，存量行靠常规检查补不到。
 
-        抓取判据不重写，直接复用连接器的 `_detail` 与 `_video_seconds`；备份先做、
+        判据与「修复与迁移」的后台项共用 `follow_backfill` 一份；备份先做、
         分批提交，续跑只跳过上一趟真正写入的条目。
         """
         backfill = load_script("backfill_rule34_details")
+        self.assertIs(backfill.post_pending, follow_backfill.post_pending)
+        self.assertIs(backfill.write_update, follow_backfill.write_update)
         # 连接与备份走共享的 `open_for_write`／`open_readonly`，WAL 正确性由
         # `scripting` 那条回归测试守住；这里只钉「用的是那一份」。断言源码里有没有
         # `reader.backup(writer)` 这串字符的话，脚本一改成调用共享实现就会红——
@@ -1732,13 +1734,13 @@ class OperationalScriptTests(unittest.TestCase):
         # 只补不抹：已有的类型与时长不覆盖，帖子页没给上传时间就不动它。
         typed, untyped = pending
         detail = {"tag_types": {"a": "artist"}, "published_at": "2026-05-01T16:32:21Z"}
-        self.assertEqual(backfill.plan_update(typed, detail, 60.054),
+        self.assertEqual(follow_backfill.plan_update(typed, detail, 60.054),
                          {"published_at": "2026-05-01T16:32:21Z"})
-        plan = backfill.plan_update(untyped, detail, 60.054)
+        plan = follow_backfill.plan_update(untyped, detail, 60.054)
         self.assertEqual((plan["published_at"], plan["duration"]),
                          ("2026-05-01T16:32:21Z", 60.054))
         self.assertEqual(json.loads(plan["metadata_json"]), {"tag_types": {"a": "artist"}})
-        self.assertIsNone(backfill.plan_update(
+        self.assertIsNone(follow_backfill.plan_update(
             typed, {"tag_types": {"a": "artist"}, "published_at": None}, None))
 
         # 写入与续跑：写过的条目在 CSV 里记 `written=yes`，下一趟 `--resume` 跳过它。
@@ -1803,6 +1805,7 @@ class OperationalScriptTests(unittest.TestCase):
         """存量行只把站方 Characters 组里的名字改记 character，别的类型与列一格不动。"""
         backfill = load_script("backfill_rule34video_characters")
         self.assertIs(backfill.open_for_write, scripting.open_for_write)
+        self.assertIs(backfill.inspect_video, follow_backfill.inspect_video)
         root = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, root, True)
         database = root / "ledger.db"
@@ -1833,7 +1836,7 @@ class OperationalScriptTests(unittest.TestCase):
         asked = []
 
         class Connector:
-            def _get(self, url, headers=None):
+            def probe(self, url, headers=None):
                 asked.append(url)
                 return HttpResponse(200, {}, detail)
 
@@ -2000,7 +2003,7 @@ class OperationalScriptTests(unittest.TestCase):
         posix = (ROOT / "scripts" / "test.sh").read_text(encoding="utf-8")
         self.assertIn("rev-parse --git-common-dir", posix)
         self.assertIn("peach.__file__", posix)
-        self.assertIn("full|auto|follow|catalog|media|sync|metadata|tooling|web|checks|core|packaging)", posix)
+        self.assertIn("full|auto|follow|catalog|media|sync|metadata|tooling|delivery|web|checks|core|packaging)", posix)
         # 文档里可以「提到」裸命令来说明它为什么不可信，但绝不能让它单独出现成为一条可照抄的指令。
         # 判据因此不是黑名单，而是：凡出现该命令的行，必须在同一行指向某个正式入口。
         for relative in ("AGENTS.md", "docs/TESTING.md"):
@@ -2104,7 +2107,7 @@ class OperationalScriptTests(unittest.TestCase):
         self.assertEqual(listed.getvalue().split(), ["full", "auto", *runner.SCOPES])
 
     def test_every_test_file_is_registered_in_a_scope(self):
-        """新测试文件必须登记进 `scripts/test_runner.py` 的域，否则只有 `full` 才跑到它。"""
+        """新测试文件必须登记进 `scripts/scope_registry.toml` 的域，否则只有 `full` 才跑到它。"""
         runner = load_script("test_runner")
         patterns = (*runner.COMMON_PATTERNS,
                     *(pattern for scopes in runner.SCOPES.values() for pattern in scopes))
@@ -2113,7 +2116,7 @@ class OperationalScriptTests(unittest.TestCase):
             if not any(path.match(pattern) for pattern in patterns))
         self.assertEqual(
             orphans, [],
-            "这些测试文件不属于任何域，把它们登记进 scripts/test_runner.py 的 SCOPES"
+            "这些测试文件不属于任何域，把它们登记进 scripts/scope_registry.toml 的 [scopes]"
             "（或 COMMON_PATTERNS），否则只有 full 才跑到它们：\n  " + "\n  ".join(orphans))
 
     def test_auto_scope_maps_changed_files_and_falls_back_to_full(self):
@@ -4909,6 +4912,50 @@ class ScriptingConventionTests(unittest.TestCase):
         limiter.wait("https://mobile.x.com/a")
         limiter.wait("https://www.x.com/b")
         self.assertEqual(slept, [2.0], "同一主机的第二次请求必须等一个间隔")
+
+    def test_a_shared_slot_keeps_two_processes_apart_by_each_ones_interval(self):
+        """服务与采集脚本各自限速时合起来会超速；共用一个节拍文件后每次至少比上一次晚自己的间隔。"""
+        now = [1000.0]
+        slept: list[float] = []
+
+        def sleeper(seconds):
+            slept.append(seconds)
+            now[0] += seconds
+        with tempfile.TemporaryDirectory() as tmp:
+            path = scripting.shared_slot_path(Path(tmp), "javdb.com")
+            script = scripting.SharedSlot(path, clock=lambda: now[0], sleeper=sleeper)
+            service = scripting.SharedSlot(path, clock=lambda: now[0], sleeper=sleeper)
+            script.take(5.0)
+            service.take(3.0)
+            script.take(5.0)
+            self.assertEqual(slept, [3.0, 3.0], "后来的那一方等满自己的间隔，不叠加对方的")
+            # 坏值、钟回拨留下的远未来时刻都只封顶在自己的间隔内。
+            path.write_text("not a number", encoding="utf-8")
+            service.take(3.0)
+            self.assertEqual(slept, [3.0, 3.0])
+            path.write_text(repr(now[0] + 10_000), encoding="utf-8")
+            service.take(3.0)
+            self.assertEqual(slept[-1], 3.0)
+            # 写不了（路径被目录占了）就只按进程内限速，不挡取页。
+            blocked = Path(tmp) / "blocked"
+            blocked.mkdir()
+            scripting.SharedSlot(blocked, clock=lambda: now[0], sleeper=sleeper).take(3.0)
+
+    def test_host_limiter_waits_for_another_process_on_a_shared_host_only(self):
+        import time
+        slept: list[float] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            path = scripting.shared_slot_path(Path(tmp), "javdb.com")
+            limiter = scripting.HostLimiter({"javdb.com": 3.0, "x.com": 3.0}, sleeper=slept.append)
+            limiter.share("javdb.com", path)
+            path.parent.mkdir(parents=True)
+            path.write_text(repr(time.time() + 2.0), encoding="utf-8")
+            limiter.wait("https://x.com/a")
+            self.assertEqual(slept, [], "没共用的主机不看别的进程")
+            limiter.wait("https://javdb.com/actors/1")
+            self.assertEqual(len(slept), 1)
+            self.assertGreater(slept[0], 1.0, "脚本刚发过一页，服务这一页要等它的间隔")
+            self.assertGreater(float(path.read_text(encoding="utf-8")), time.time() + 2.0)
 
     def test_host_under_rejects_a_domain_that_merely_ends_with_the_key(self):
         self.assertTrue(scripting.host_under("x.com", ("x.com",)))

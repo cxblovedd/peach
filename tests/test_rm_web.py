@@ -32,6 +32,100 @@ from support.stalls import stalled_mount
 
 
 class WebDataTests(unittest.TestCase):
+    def test_scalar_column_filters_match_displayed_stars_and_resolution(self):
+        with self.contract.write_transaction() as connection:
+            connection.execute("UPDATE asset SET rating=80,width=1920,height=1080 WHERE id=1")
+            connection.execute("UPDATE asset SET rating=NULL,width=NULL,height=NULL WHERE id=2")
+        selected = json.dumps({'rating': ['4'], 'resolution': ['1920x1080']})
+        result = q_items(self.contract, {'column_filters': selected})
+        self.assertEqual([row['id'] for row in result['items']], [1])
+        self.assertEqual(q_items(self.contract, {'column_filters': '{"rating":["0"]}'})['total'], 1)
+        self.assertEqual(q_items(self.contract, {'column_filters': '{"resolution":{"exclude":["none"]}}'})['total'], 1)
+        options = rm_web.dispatch_api_get(self.contract, '/api/facets', {'column': 'rating'})
+        self.assertEqual({row['k']: row['n'] for row in options['items']}, {'0': 1, '4': 1})
+
+    def test_queue_facets_intersect_columns_and_count_each_row_once(self):
+        from peach.table_filters import filter_rows
+        rows = [{'id': 1, 'library': ['a'], 'why': ['x', 'x', 'y']},
+                {'id': 2, 'library': ['b'], 'why': ['x']}, {'id': 3, 'library': ['a'], 'why': []}]
+        filtered, facets = filter_rows(rows, '{"library":["a"],"why":{"exclude":["y"]}}',
+                                      {'library': lambda row: row['library'], 'why': lambda row: row['why']})
+        self.assertEqual([row['id'] for row in filtered], [3])
+        self.assertEqual(facets['why'], [{'id': 'none', 'count': 1}, {'id': 'x', 'count': 1}, {'id': 'y', 'count': 1}])
+        self.assertEqual(facets['library'], [{'id': 'a', 'count': 1}, {'id': 'b', 'count': 1}])
+        with self.assertRaises(ValueError):
+            filter_rows(rows, '{"unknown":[]}', {'library': lambda row: row['library']})
+
+    def test_quality_column_filters_apply_before_the_returned_page_limit(self):
+        with self.contract.write_transaction() as connection:
+            connection.executemany("INSERT INTO asset(id,location,path,name,medium,size) VALUES(?,'local',?,?,'video',1)",
+                                   [(1000 + i, f'R:/Media/filter-{i}.mp4', f'filter-{i}.mp4') for i in range(205)])
+            connection.executemany("INSERT INTO asset_quality_goal(profile_id,asset_id,wanted,reason,updated_at) VALUES('local-default',?,1,?,'now')",
+                                   [(1000 + i, 'tail' if i == 0 else 'common') for i in range(205)])
+        with mock.patch.object(web_stats.settings_file, 'active', return_value=object()), \
+                mock.patch('peach.media_identity.ownership', return_value={'library_id': 'a'}):
+            result = rm_web.q_quality_goals(self.contract, {'limit': '200', 'column_filters': '{"reason":["tail"]}'})
+        self.assertEqual(result['total'], 1)
+        self.assertEqual([row['id'] for row in result['items']], [1000])
+        self.assertEqual(result['column_facets']['reason'], [{'id': 'common', 'count': 204}, {'id': 'tail', 'count': 1}])
+
+    def test_column_facets_page_scoped_people_and_search_aliases(self):
+        with self.contract.write_transaction() as connection:
+            connection.executemany(
+                "INSERT INTO entity(id,kind,canonical_name,normalized_name,created_at,updated_at) "
+                "VALUES(?,'performer',?,?,'now','now')",
+                [(9000 + index, f'Person {index}', f'person {index}') for index in range(25)])
+            connection.executemany(
+                "INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) "
+                "VALUES(1,?,'performer','test',1)", [(9000 + index,) for index in range(25)])
+            connection.execute("INSERT INTO entity_alias(entity_id,alias,normalized_alias,source,confidence) "
+                               "VALUES(11,'Alicia','alicia','test',1)")
+        people = rm_web.dispatch_api_get(self.contract, '/api/facets', {'column': 'people', 'loc': 'local'})
+        self.assertEqual(len(people['items']), 24)
+        self.assertEqual(people['next_offset'], 24)
+        tail = rm_web.dispatch_api_get(self.contract, '/api/facets', {
+            'column': 'people', 'loc': 'local', 'column_offset': '24'})
+        self.assertFalse(tail['has_more'])
+        self.assertIsNone(tail['next_offset'])
+        self.assertFalse({row['id'] for row in people['items']} & {row['id'] for row in tail['items']})
+        people['items'].extend(tail['items'])
+        self.assertEqual(len([row for row in people['items'] if row['kind'] == 'performer']), 26)
+        self.assertTrue(all(row['n'] == 1 for row in people['items']))
+        self.assertIn('Alicia', next(row for row in people['items'] if row['id'] == 11)['aliases'])
+        alias = rm_web.dispatch_api_get(self.contract, '/api/facets', {
+            'column': 'people', 'loc': 'local', 'column_q': 'Alicia'})
+        self.assertEqual([row['id'] for row in alias['items']], [11])
+        other = rm_web.dispatch_api_get(self.contract, '/api/facets', {'column': 'people', 'loc': '115'})
+        self.assertEqual([(row['kind'], row['k'], row['n']) for row in other['items']],
+                         [('creator', 'Canonical Creator', 1)])
+        self.assertIn('has_image', other['items'][0])
+        tags = rm_web.dispatch_api_get(self.contract, '/api/facets', {'column': 'tags', 'loc': 'local'})
+        self.assertEqual([(row['kind'], row['k'], row['n']) for row in tags['items']], [('tag', '足交', 1)])
+        self.assertIn('stats', rm_web.dispatch_api_get(self.contract, '/api/facets', {'loc': 'local'}))
+        with self.assertRaisesRegex(ValueError, 'invalid facet column'):
+            rm_web.dispatch_api_get(self.contract, '/api/facets', {'column': 'unknown'})
+
+    def test_table_column_filter_intersects_the_entity_scope(self):
+        query = {'scope_kind': 'creator', 'scope_name': 'Canonical Creator', 'performer': 'Canonical Alice'}
+        self.assertEqual([row['id'] for row in q_items(self.contract, query)['items']], [1])
+        self.assertEqual(q_items(self.contract, {**query, 'loc': '115'})['total'], 0)
+        with self.assertRaisesRegex(ValueError, 'invalid catalog scope'):
+            q_items(self.contract, {'scope_kind': 'unknown', 'scope_name': 'Canonical Creator'})
+
+    def test_column_multiselect_unions_each_column_and_intersects_columns(self):
+        selected = {'people': ['performer:Canonical Alice', 'creator:Canonical Creator']}
+        self.assertEqual(q_items(self.contract, {'column_filters': json.dumps(selected)})['total'], 2)
+        selected['tags'] = ['足交', '不存在的标签']
+        self.assertEqual([row['id'] for row in q_items(self.contract, {'column_filters': json.dumps(selected)})['items']], [1])
+        self.assertEqual(q_items(self.contract, {'loc': '115', 'column_filters': json.dumps(selected)})['total'], 0)
+        self.assertEqual(q_items(self.contract, {'column_filters': '{"people":[]}'})['total'], 0)
+        self.assertEqual(q_items(self.contract, {'column_filters': '{}'})['total'], 2)
+        self.assertEqual(q_items(self.contract, {'column_filters': json.dumps({
+            'people': {'exclude': ['performer:Canonical Alice']}})})['total'], 1)
+        for malformed in ('[]', 'broken', '{"people":"Alice"}', '{"people":["unknown:Alice"]}'):
+            with self.subTest(value=malformed), self.assertRaises(ValueError):
+                q_items(self.contract, {'column_filters': malformed})
+
     def test_catalog_summary_preserves_filters_without_projecting_cards(self):
         for filters in ({}, {'loc': '115'}, {'year': '2024'}, {'year': '1900'}):
             with self.subTest(filters=filters):
@@ -478,6 +572,28 @@ class WebDataTests(unittest.TestCase):
         self.assertEqual([(row["k"], row["n"]) for row in tops["performers"]], [("Canonical Alice", 2)])
         self.assertEqual(next(row["n"] for row in index["items"] if row["k"] == "Canonical Alice"), 2)
         self.assertEqual([(row["k"], row["n"]) for row in facets["tagperformers"]], [("Canonical Alice", 2)])
+
+    def test_starting_playback_keeps_inventory_and_storage_aggregates_and_refreshes_watched_state(self):
+        from peach import web_activity, web_folders
+        with mock.patch.object(web_stats, '_storage_volumes', return_value=[]), \
+                mock.patch.object(web_stats, '_ledger_stats', wraps=web_stats._ledger_stats) as inventory, \
+                mock.patch.object(web_stats, '_storage_stats', wraps=web_stats._storage_stats) as storage, \
+                mock.patch('peach.media_folders.directory_index', return_value={}) as folders, \
+                mock.patch.object(web_batch, '_scored_junk', return_value=([], frozenset())) as junk:
+            def load():
+                web_folders.q_folders(self.contract, {})
+                web_batch.q_ads(self.contract)
+                return web_stats.q_stats(self.contract)
+            before = load()
+            unseen = q_items(self.contract, {'state': 'fresh'})
+            with self.contract.read_connection() as connection:
+                target = connection.execute("SELECT id FROM asset WHERE medium='video' AND COALESCE(play_count,0)=0 "
+                                            "AND feedback IS NULL AND disposal IS NULL LIMIT 1").fetchone()[0]
+            web_activity.w_play(self.contract, {'id': target})
+            after = load()
+            self.assertEqual(after['consumption']['library_played'], before['consumption']['library_played'] + 1)
+            self.assertEqual(q_items(self.contract, {'state': 'fresh'})['total'], unseen['total'] - 1)
+            self.assertEqual([inventory.call_count, storage.call_count, folders.call_count, junk.call_count], [1, 1, 1, 1])
 
     def test_creator_card_and_detail_share_available_entity_image(self):
         (self.avatars / f"{entity_image_key('creator', 12)}.img").write_bytes(b"image")
@@ -1816,7 +1932,7 @@ class WebDataTests(unittest.TestCase):
             "/api/library-shortcuts", "/api/folders/preview", "/api/folders/rule",
             "/api/custom-metadata",
             "/api/preference", "/api/quality-goal", "/api/item-tag", "/api/item-edit", "/api/batch",
-            "/api/search-history", "/api/trash/empty",
+            "/api/ads/dispose-all", "/api/ads/restore-all", "/api/search-history", "/api/trash/empty",
             "/api/review/decision", "/api/review/genre", "/api/review/auto-landings/revert",
             "/api/purge-missing", "/api/orphan-records/attach",
             "/api/links/check", "/api/links/prune",
@@ -2296,30 +2412,55 @@ class WebDataTests(unittest.TestCase):
         self.assertFalse(landed[0].exists())
         self.assertEqual(original.read_bytes(), b"media")
 
-    def test_empty_trash_moves_media_outside_the_write_lock_and_spares_rows_restored_meanwhile(self):
-        """网盘上逐个 stat、改名不占写锁；这期间被还原出回收站的，事务里复核时留下、文件放回原处。"""
+    def test_empty_trash_moves_media_outside_the_write_lock_and_refuses_restores_meanwhile(self):
+        """网盘上逐个 stat、改名或直接删除不占写锁；这期间还原出回收站被拒，不会留下没有文件的行。"""
         binned = self.stage_media(1, "binned.mp4")
-        restored = self.stage_media(2, "restored.mp4")
+        other = self.stage_media(2, "other.mp4")
         rm_web.w_feedback(self.contract, {"id": 1, "kind": "dispose"})
         rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
         quarantine = web_batch._quarantine_media
-        locked = []
+        locked, refused = [], []
 
         def outside_lock(original, **kwargs):
             locked.append(self.contract.database.write_lock.locked())
             moved = quarantine(original, **kwargs)
-            if original == restored and not locked[-1]:
-                rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
+            if original == other:
+                for restore in (lambda: rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"}),
+                                lambda: rm_web.w_batch(self.contract, {"ids": [2], "operation": "restore"})):
+                    with self.assertRaisesRegex(ValueError, "正在永久删除"):
+                        restore()
+                    refused.append(True)
             return moved
         with mock.patch.object(web_batch, "_quarantine_media", side_effect=outside_lock):
             result = rm_web.w_empty_trash(self.contract)
 
-        self.assertEqual(locked, [False, False])
+        self.assertEqual((locked, refused), ([False, False], [True, True]))
+        self.assertEqual((result["purged"], result["blocked"]), (2, []))
+        self.assertFalse(binned.exists() or other.exists())
+        self.assertIsNone(self.row(1))
+        self.assertIsNone(self.row(2))
+        self.assertFalse(web_batch.being_purged([1, 2]), "删完就撤下登记")
+
+    def test_a_row_restored_just_before_the_purge_starts_is_left_alone(self):
+        """读完回收站、登记之前就被还原的那一条：动文件前按最新的行再筛一遍，文件一下都不碰。"""
+        binned = self.stage_media(1, "binned.mp4")
+        restored = self.stage_media(2, "restored.mp4")
+        rm_web.w_feedback(self.contract, {"id": 1, "kind": "dispose"})
+        rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
+        register = web_batch.purging
+
+        def restore_first(ids):
+            rm_web.w_feedback(self.contract, {"id": 2, "kind": "dispose"})
+            return register(ids)
+        with mock.patch.object(web_batch, "purging", side_effect=restore_first), \
+                mock.patch.object(web_batch, "_quarantine_media", wraps=web_batch._quarantine_media) as moved:
+            result = rm_web.w_empty_trash(self.contract)
+
         self.assertEqual(result["purged"], 1)
         self.assertEqual([item["id"] for item in result["blocked"]], [2])
+        self.assertEqual([call.args[0] for call in moved.call_args_list], [binned])
         self.assertFalse(binned.exists())
-        self.assertIsNone(self.row(1))
-        self.assertTrue(restored.is_file(), "隔离期间被还原的，文件放回原处")
+        self.assertTrue(restored.is_file())
         self.assertIsNone(self.row(2)["disposal"])
 
     def test_a_purge_cleans_only_what_the_deleted_rows_left_behind(self):
@@ -2536,9 +2677,13 @@ class WebDataTests(unittest.TestCase):
 
     def test_better_version_targets_have_a_management_read_surface(self):
         rm_web.w_quality_goal(self.contract, {"id": 1, "wanted": True})
-        queue = rm_web.q_quality_goals(self.contract, {"limit": "20"})
+        with mock.patch.object(web_stats.settings_file, "active", return_value=object()), \
+                mock.patch("peach.media_identity.ownership", return_value={"library_id": "lib-a"}):
+            queue = rm_web.q_quality_goals(self.contract, {"limit": "20"})
         self.assertEqual(queue["total"], 1)
         self.assertEqual(queue["items"][0]["id"], 1)
+        # 所属媒体库同作品列表，按路径算；路径本身不下发。
+        self.assertEqual(queue["items"][0]["library_id"], "lib-a")
         self.assertNotIn("path", queue["items"][0])
         self.assertFalse(queue["has_more"])
         rm_web.w_batch(self.contract, {"ids": [1, 2], "operation": "dispose"})
@@ -3822,6 +3967,31 @@ class JavModeAndCoverTests(unittest.TestCase):
                 rm_web.q_items(self.contract, {"jav": "1", "limit": "20"})["items"]}
         self.assertIsNone(rows[1]["poster_box"])
 
+    def test_a_whole_picture_and_its_front_image_reach_the_card_frame(self):
+        """竖版图证明不是封套时人脸边车不一定在，卡片仍得知道不能切、大图位改用竖版正封。"""
+        (self.covers / "ABW-232.jpg").write_bytes(b"x")
+        (self.covers / "ABW-232.poster.json").write_text(json.dumps({
+            "version": jav_poster_crop.ALGORITHM_VERSION, "px": [2184, 1542], "layout": "still",
+            "front": [1536, 2184], "box": {"x0": 0, "y0": 0, "x1": 2184, "y1": 1542, "method": "none"},
+        }), encoding="utf-8")
+        self.contract.cache_bust()
+        # 竖版正封文件不在：页面照旧用横图，不去取一张 404。
+        self.assertEqual(self.contract.cover_frame("ABW-232"), {"layout": "still"})
+        version = self.covers.stat().st_mtime_ns
+        (self.covers / "front").mkdir()
+        (self.covers / "front" / "ABW-232.jpg").write_bytes(b"x")
+        # 这条只核对投影，显式推进目录版本，避免连续写入落在同一 NTFS 时钟刻度。
+        os.utime(self.covers, ns=(0, version + 1_000_000))
+        self.contract.cache_bust()
+        self.assertEqual(self.contract.cover_frame("ABW-232"), {"layout": "still", "front": True})
+        self.assertIsNone(self.contract.poster_box("ABW-232"))
+        (self.covers / "ABW-232.face.json").write_text(
+            '{"ratio":1.42,"face":{"cx":0.3,"cy":0.2}}', encoding="utf-8")
+        os.utime(self.covers, ns=(0, version + 2_000_000))
+        self.contract.cache_bust()
+        self.assertEqual(self.contract.cover_frame("ABW-232"),
+                         {"cx": 0.3, "cy": 0.2, "layout": "still", "front": True})
+
     def test_a_stale_or_corrupt_poster_sidecar_is_ignored(self):
         (self.covers / "ABW-232.jpg").write_bytes(b"x")
         (self.covers / "ABW-232.poster.json").write_text("{not json", encoding="utf-8")
@@ -4090,6 +4260,25 @@ class DuplicateDetectionTests(unittest.TestCase):
         result = self.groups()
         self.assertEqual(result["total"], 1)
         self.assertEqual(result["groups"][0]["count"], 2)
+
+    def test_duplicate_files_read_current_cover_without_mutating_cached_groups(self):
+        self.add('ABW-232', 7200, 5_000_000_000)
+        self.add('ABW-232', 7200, 3_000_000_000)
+        self.con.execute("UPDATE asset SET path=?,name='clip.strm' WHERE id=1", (r'R:\Media\clip.strm',))
+        self.con.commit()
+        with mock.patch.object(self.contract, 'has_cover', return_value=True) as available, \
+                mock.patch.object(self.contract, 'cover_version', return_value='cover-v1'), \
+                mock.patch.object(self.contract, 'cover_frame', return_value=None), \
+                mock.patch.object(self.contract, 'poster_box', return_value=None):
+            files = self.groups()['groups'][0]['files']
+            self.assertTrue(all(item['has_cover'] for item in files))
+            self.assertEqual(files[0]['cover_key'], 'ABW-232')
+            self.assertEqual(files[0]['cover_version'], 'cover-v1')
+            self.assertEqual(files[0]['size'], 5_000_000_000)
+            available.return_value = False
+            files = self.groups()['groups'][0]['files']
+            self.assertTrue(all(not item['has_cover'] for item in files))
+            self.assertNotIn('cover_version', files[0])
 
     def test_shared_filename_rips_with_missing_duration_are_candidates(self):
         """同名且已知时长在容差内的副本进入重复候选，缺测量的一份保留。"""

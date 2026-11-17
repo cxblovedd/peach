@@ -25,7 +25,7 @@ from .scripting import HostLimiter
 from .user_agent import JAVDB_APP_USER_AGENT
 from .jav_cache import DAY, PublicSnapshots, cache_lifetime
 from .javdb_identity import RULE, cache_key as identity_cache_key, current_evidence
-from .metadata import RelayableError
+from .metadata import RelayableError, relay_args
 from .user_messages import UserValueError, nested_message
 
 WEB = "https://catembylegacy.fastcdn.dpdns.org"
@@ -300,7 +300,11 @@ class PublicAPI:
             self.page_context.reset(token)
 
     def _login_walled(self, ask, path, parse):
-        """搜索与作品资料：接口答就用接口；要求登录时改读网页，评论与磁链不经这里、照常问接口。"""
+        """搜索与作品资料：接口答就用接口；要求登录时改读网页，评论与磁链不经这里、照常问接口。
+
+        网页那一站在冷却或本趟预算用完时（`SourcePaused`）交 `PublicSourcePaused`，沿用旧快照、不往外冒。
+        """
+        from .scraping_access import SourcePaused
         from .sources.base import SourceFailure
         if self.clock() >= self.login_until:
             try:
@@ -312,6 +316,8 @@ class PublicAPI:
             raise PublicLoginRequired(_UNAVAILABLE)
         try:
             return parse(reader(path))
+        except SourcePaused as error:
+            raise PublicSourcePaused(*relay_args(error)) from error
         except (OSError, ValueError, TypeError, AttributeError, KeyError, SourceFailure) as error:
             raise PublicSourceUnavailable(_UNAVAILABLE) from error
 
@@ -675,8 +681,8 @@ class PublicAPI:
             raise PublicSourceUnavailable("errors.javdbPublic.unrecognizedFormat")
         return [row for row in rows if isinstance(row, dict)]
 
-    def peek_movie(self, code: str) -> dict | None:
-        """只读已取得的资料，不触发网络；供发现排序投影。"""
+    def peek_movie_identity(self, code: str) -> str | None:
+        """只读当前确认的唯一来源身份，歧义和缺失保持未取得。"""
         with self.lock:
             canonical = normalise_code_key(code)
             identity_key = 'movie-id:' + canonical
@@ -687,7 +693,17 @@ class PublicAPI:
                 identity = stored.value if stored else None
             if not isinstance(identity, list) or len(identity) != 1:
                 return None
-            key = f'movie:{canonical}:{identity[0]}'
+            value = identity[0]
+            return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9]+', value) else None
+
+    def peek_movie(self, code: str) -> dict | None:
+        """只读已取得的资料，不触发网络；供发现排序投影。"""
+        with self.lock:
+            identity = self.peek_movie_identity(code)
+            if identity is None:
+                return None
+            canonical = normalise_code_key(code)
+            key = f'movie:{canonical}:{identity}'
             cache_key = self._cache_key(key)
             hit = self.cache.get(cache_key)
             snapshot = self.snapshots.get(cache_key) or self._store().load(identity_cache_key(key))
@@ -748,6 +764,14 @@ class PublicAPI:
         try:
             rows = self.magnets(code, refresh=refresh, movie=movie)
         except PublicSourceUnavailable as error:
+            if isinstance(error, PublicLoginRequired) and self.page_context.get() is not None:
+                from .sources.base import SourceFailure
+                from .sources.javdb import page_resources
+                from .metadata import relay_args
+                try:
+                    return page_resources(code, movie, self.page_context.get(), review_pages=review_pages)
+                except SourceFailure as page_error:
+                    raise PublicSourceUnavailable(*relay_args(page_error)) from page_error
             rows = []
             magnet_failed = True
             warnings.append(Said("labels.javdbPublic.magnetsUnfetched", error=nested_message(error)))

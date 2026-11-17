@@ -75,7 +75,10 @@
     "unkeptGroups_one": "Removed {{count, number}} group from Kept",
     "unkeptGroups_other": "Removed {{count, number}} groups from Kept",
     "unkeptOne": "{{code}} is back in the duplicate list",
-    "viewKept": "Kept ({{count, number}})"
+    "viewKept": "Kept ({{count, number}})",
+    "selectFile": "Select {{name}} for Trash",
+    "trashSelectedFiles": "Trash {{count, number}} selected",
+    "selectedTrashBody": "Move the {{count, number}} selected files ({{size}}) to Trash and keep the other {{remaining, number}} files."
   },
   "junk": {
     "backToUndecided": "Back to undecided",
@@ -95,6 +98,7 @@
     "kindUrlShortcuts": "Internet shortcuts",
     "kindUrls": "URLs",
     "kindVideos": "Videos",
+    "listReason": "Reason",
     "locating": "Locating",
     "notJunk": "Not junk",
     "reconsider": "Reconsider",
@@ -107,7 +111,10 @@
     "undecided": "Undecided",
     "unknownSize": "Unknown size",
     "untitled": "Unnamed item",
-    "viewUndecided": "View undecided"
+    "viewUndecided": "View undecided",
+    "copies": "{{count, number}} copies with the same name and size · {{size}} total",
+    "showCopies": "Show copies",
+    "hideCopies": "Hide copies"
   },
   "links": {
     "allReachable": "All links are reachable.",
@@ -153,6 +160,8 @@
     "pruneRetired_one": "{{count, number}} link of a retired actress is kept as a non-clickable record.",
     "pruneRetired_other": "{{count, number}} links of retired actresses are kept as non-clickable records.",
     "pruning": "Rechecking and deleting dead links",
+    "rechecked_one": "Looks temporary; tried {{count, number}} time",
+    "rechecked_other": "Looks temporary; tried {{count, number}} times",
     "rechecking": "Rechecking links",
     "retryAll_one": "Retry all now ({{count, number}})",
     "retryAll_other": "Retry all now ({{count, number}})",

@@ -11,7 +11,10 @@
 """
 from __future__ import annotations
 
+import threading
+from collections import Counter
 from collections.abc import Iterable
+from contextlib import contextmanager
 
 #: 构成个人记录的六张表。任一张有指向这一行的记录，或行上四列记过，这一行就算「带个人记录」。
 PERSONAL_RECORD_TABLES = (
@@ -29,6 +32,7 @@ ASSET_RECORD_PREDICATE = ("(rating IS NOT NULL OR COALESCE(o_count,0)>0 "
 #: 一行 `asset` 被物理删除时要一并清掉的引用表，删除与搬运记录的边界只写在这一处。
 #: `asset_search` 不在其中：0004 的 `asset_search_asset_delete` 触发器已经负责 FTS 行，
 #: 这里再删一遍只会重复，还会诱使测试库伪造一张同名普通表，把 has_fts() 骗成 True。
+#: `ledger_upgrade_item` 的派生状态由 0058 的资产删除触发器清理，不参与个人记录搬运。
 ASSET_REFERENCE_TABLES = (
     "asset_tag", "media_binding", "activity_event", "asset_entity",
     "watch_queue", "asset_preference", "asset_tag_preference", "asset_quality_goal",
@@ -37,6 +41,35 @@ ASSET_REFERENCE_TABLES = (
 
 #: 文件已不在盘上、带着个人记录的那一档。
 VANISHED = "vanished"
+
+#: 正在永久删除的资产：清除在写事务外删网盘文件（rclone 挂载上直接删、没有隔离件可放回），
+#: 这段时间里把它还原出回收站，行留下、文件已没了。还原入口见到登记中的编号就拒绝。
+#: 只管本进程里的还原；同时在跑的几次清除可能登记同一部，所以按次数计。
+_PURGING: Counter = Counter()
+_PURGING_LOCK = threading.Lock()
+
+
+@contextmanager
+def purging(ids: Iterable[int]):
+    """这几部正在永久删除：块内 `being_purged` 对它们为真。"""
+    ids = list(ids)
+    with _PURGING_LOCK:
+        _PURGING.update(ids)
+    try:
+        yield
+    finally:
+        with _PURGING_LOCK:
+            _PURGING.subtract(ids)
+            for asset_id in ids:
+                if _PURGING[asset_id] <= 0:
+                    del _PURGING[asset_id]
+
+
+def being_purged(ids: Iterable[int]) -> bool:
+    """这些资产里有正在永久删除的。"""
+    with _PURGING_LOCK:
+        return any(_PURGING.get(asset_id, 0) > 0 for asset_id in ids)
+
 
 #: 一次 `IN (...)` 最多带多少个参数，留在 SQLite 默认上限之内。
 _CHUNK = 400

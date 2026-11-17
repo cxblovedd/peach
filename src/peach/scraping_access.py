@@ -161,6 +161,25 @@ def sends_cookie(source: str | None) -> bool:
     return bool(entry.get("session")) and (not entry.get("account") or _WITH_ACCOUNT.get())
 
 
+#: 恢复时刻的说法：当天、次日各按凌晨（6 点前）、白天、晚上（18 点起）三档，后天一档，再远带月日。
+RESUME_PHRASES = {0: ("labels.resumeAt.earlyToday", "labels.resumeAt.today", "labels.resumeAt.tonight"),
+                  1: ("labels.resumeAt.earlyTomorrow", "labels.resumeAt.tomorrow", "labels.resumeAt.tomorrowNight")}
+
+
+def resume_phrase(moment: float, now: float | None = None) -> dict:
+    """来源恢复的本机时刻说成「今晚 21:39」「明天 09:00」，再远带月日。
+
+    返回 `{code, params}` 嵌套的一句，后端与前端都按显示语言渲染。相对的说法以给出报错的时刻为准，
+    只用于来源暂停这类很快就会被看到的提示。"""
+    at = datetime.fromtimestamp(moment)
+    days = (at.date() - datetime.fromtimestamp(time.time() if now is None else now).date()).days
+    if days in RESUME_PHRASES:
+        code = RESUME_PHRASES[days][0 if at.hour < 6 else 2 if at.hour >= 18 else 1]
+    else:
+        code = "labels.resumeAt.dayAfter" if days == 2 else "labels.resumeAt.date"
+    return {"code": code, "params": {"clock": at.strftime("%H:%M"), "month": at.month, "day": at.day}}
+
+
 def _paused(source: str | None, kind: str, until: float) -> "SourcePaused":
     """冷却、限流、拒绝三种停下的报错；登记过的来源点名并写出大约还要停多久，没登记的照旧泛称。"""
     label = SOURCES.get(source or "", {}).get("label")
@@ -443,6 +462,34 @@ def record_source_check(root: Path, source: str, stage: str, record: dict) -> No
             LOGGER.warning("Diagnostics record for source %s was not saved", source)
 
 
+#: 后台采集浏览器的模式（ADR-0065 的窗口回退与无窗口两种），存在凭据根下，跟 profile 同一台机器。
+BROWSER_MODE_FILE = "scraping-browser.json"
+#: `window`：窗口留在屏幕外，自动过不了的验证等人从任务栏点开再点；`headless`：不创建窗口，过不了就冷却。
+BROWSER_MODES = ("window", "headless")
+
+
+def browser_mode(root: Path) -> str:
+    """这台机器后台采集浏览器用哪种模式；没设过、读不出来都按 `window`。"""
+    try:
+        value = json.loads((Path(root) / BROWSER_MODE_FILE).read_text(encoding="utf-8")).get("mode")
+    except (OSError, ValueError, AttributeError):
+        return BROWSER_MODES[0]
+    return value if value in BROWSER_MODES else BROWSER_MODES[0]
+
+
+def browser_headless(root: Path) -> bool:
+    return browser_mode(root) == "headless"
+
+
+def save_browser_mode(root: Path, mode: str) -> str:
+    """改后台采集浏览器的模式；正在跑的浏览器在下一条请求时按新模式重开。"""
+    if mode not in BROWSER_MODES:
+        raise UserValueError("errors.scrapingAccess.browserModeInvalid", {"choices": "/".join(BROWSER_MODES)})
+    Path(root).mkdir(parents=True, exist_ok=True)
+    atomic_write_text(Path(root) / BROWSER_MODE_FILE, json.dumps({"mode": mode}), mode=0o600)
+    return mode
+
+
 def browser_profile(root: Path) -> Path:
     """浏览器 profile 放在凭据根下：里面是 `cf_clearance` 与站点会话，和贴进来的 Cookie 一个性质。"""
     return Path(root) / "browser"
@@ -602,8 +649,8 @@ class SourceTransport:
             now = time.time()
             until = min(max(resume or now + 6 * 3600, now + FIRST_BLOCKED_PAUSE), now + 7 * 86400)
             _pause(cooldown, until, blocks, via)
-            shown = datetime.fromtimestamp(until).strftime("%m-%d %H:%M")
-            raise SourceRefused("errors.scrapingAccess.accountSuspended", {"label": label, "time": shown},
+            raise SourceRefused("errors.scrapingAccess.accountSuspended",
+                                {"label": label, "time": resume_phrase(until, now)},
                                 FailureReason.ACCOUNT_SUSPENDED.value)
         reason = refusal_page(response.body)
         if reason is None:
@@ -673,7 +720,9 @@ class SourceTransport:
         direct = not options.get("trust_env", True) and not proxy
         gate = SOURCES[source].get("browser_gate")
         gates = {domain: gate for domain in SOURCES[source]["domains"]} if gate else {}
-        return browser_transport.shared(browser_profile(self.root), direct=direct, proxy=proxy, gates=gates)
+        root = self.root
+        return browser_transport.shared(browser_profile(root), direct=direct, proxy=proxy, gates=gates,
+                                        headless=lambda: browser_headless(root))
 
     def _transport_for(self, source: str | None):
         """这个来源的请求走哪条路：该走浏览器（`wants_browser`）且本机有浏览器就走浏览器页面，否则 httpx。"""

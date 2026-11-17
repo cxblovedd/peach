@@ -903,6 +903,75 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         stub.start()
         self.addCleanup(stub.stop)
 
+    async def test_expired_avatar_is_available_before_its_background_refresh(self):
+        from starlette.requests import Request
+        from peach import follow_assets, routes_media
+        old = b'\x89PNG\r\n\x1a\n' + b'\x00' * 24
+        fresh = old + b'updated'
+        path = follow_assets.cache_path(routes_media._asset_root(self.app.state), 'avatars',
+                                       follow_assets.avatar_cache_key(service='fanbox', id='123'))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(old)
+        past = time.time() - routes_media.AVATAR_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        request = Request({'type': 'http', 'method': 'GET', 'headers': [], 'app': self.app})
+        with patch.object(follow_assets, 'fetch_image', return_value=fresh) as fetch, \
+                patch.object(routes_media, 'resolve_official_avatar', return_value='https://pixiv.pximg.net/icon.png'):
+            response = routes_media.follow_avatar(request, service='fanbox', id='123', args={})
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(Path(response.path).read_bytes(), old)
+            fetch.assert_not_called()
+            await response.background()
+        self.assertEqual(path.read_bytes(), fresh)
+        fetch.assert_called_once()
+
+    async def test_expired_favicon_is_available_before_its_background_refresh(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        past = time.time() - routes_media.FAVICON_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark', return_value=b'fresh-icon') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/', path.parent)
+            self.assertEqual(Path(response.path).read_bytes(), b'cached-icon')
+            fetch.assert_not_called()
+            await response.background()
+        self.assertEqual(path.read_bytes(), b'fresh-icon')
+        fetch.assert_called_once()
+
+    async def test_site_and_link_favicons_share_existing_local_bytes(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/',
+                                                       generated / 'site-marks')
+        self.assertEqual(Path(response.path), path)
+        self.assertIsNone(response.background)
+        fetch.assert_not_called()
+
+    async def test_expired_favicon_of_a_gone_link_only_uses_local_bytes(self):
+        from peach import link_marks, routes_media
+        generated = self.root / 'generated'
+        path = link_marks.cached_path(generated / 'link-marks', 'https://metadata.example/')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'cached-icon')
+        past = time.time() - routes_media.FAVICON_REFRESH_SECONDS - 1
+        os.utime(path, (past, past))
+        with patch.object(routes_media, 'GENERATED_DIR', generated), \
+                patch.object(routes_media.site_icons, 'best_mark') as fetch:
+            response = routes_media._site_mark_response(self.app.state, 'https://metadata.example/',
+                                                       path.parent, allow_fetch=False)
+        self.assertEqual(Path(response.path), path)
+        self.assertIsNone(response.background)
+        fetch.assert_not_called()
+
     async def test_follow_avatar_is_fetched_once_and_then_served_from_disk(self):
         """头像是元数据，落在本机：浏览器不直接碰 pixiv，第二次显示也不再问上游。"""
         denied = await self.client.get("/follow-avatar?service=fanbox&id=30917150")
@@ -1420,11 +1489,11 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                    for link_id in (901, 902)]
         self.assertEqual([answer.status_code for answer in answers], [200, 200])
         self.assertNotEqual(answers[0].content, answers[1].content)
-        self.assertEqual(len(list((self.root / "generated" / "link-marks").iterdir())), 2)
+        self.assertEqual(len(list((self.root / "generated" / "link-marks").glob('*.png'))), 2)
         self.assertTrue(all(url.startswith("https://web.archive.org/") for url in asked), asked)
 
-    async def test_a_link_marked_gone_gets_no_mark_and_no_upstream_request(self):
-        """已失效的链接不再去取图标：停放域名的一次请求就够杀毒软件报警。"""
+    async def test_a_gone_link_without_a_cached_mark_has_no_upstream_request(self):
+        """失效链接缺少本地圆标时返回未取得。"""
         asked = self._archive_links(lambda url: "red")
         with closing(sqlite3.connect(self.db)) as connection, connection:
             connection.execute(
@@ -2784,6 +2853,36 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertEqual(response.json()["size"], 11458972)
 
+    async def test_follow_qualities_reuses_the_complete_default_media_cache_size(self):
+        from peach.follow_stream import FollowMediaUnavailable, ResolvedFollowMedia
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.executescript((ROOT / 'migrations/0018_online_follow.sql').read_text(encoding='utf-8'))
+            connection.execute("INSERT INTO follow_source(id,provider,ref,label,url,semantics,created_at,updated_at) "
+                "VALUES(2,'rule34video','r34/1','Creator','https://rule34video.com/u','work','x','x')")
+            connection.execute("INSERT INTO follow_item(id,source_id,external_id,title,url,media_url,release_key,first_seen_at,last_seen_at) "
+                "VALUES(9,2,'9','Remote','https://rule34video.com/video/9/x/',"
+                "'https://rule34video.com/get_file/9.mp4/','remote','x','x')")
+        body = b'complete-media'
+        requests = []
+        def upstream(request):
+            requests.append(request.method)
+            self.assertEqual(request.method, 'GET')
+            return httpx.Response(200, request=request, stream=httpx.ByteStream(body),
+                                  headers={'content-type': 'video/mp4', 'content-length': str(len(body))})
+        self._swap_http_client(upstream)
+        url = 'https://rule34video.com/get_file/9.mp4/'
+        target = ResolvedFollowMedia(url, 'https://rule34video.com/video/9/x/',
+                                    allowed_hosts=('rule34video.com',), qualities=((720, url),))
+        with patch.object(self.app.state.follow_media_resolver, 'resolve', return_value=target) as resolve:
+            stored = await self.client.get('/follow-stream?id=9&t=secret')
+            self.assertEqual(stored.content, body)
+            facts = await self.client.get('/follow-qualities?id=9&t=secret')
+            self.assertEqual(facts.json(), {'qualities': [{'height': 720, 'label': '720p'}], 'size': len(body)})
+            resolve.side_effect = FollowMediaUnavailable('errors.followStream.mediaUrlUnavailable')
+            offline = await self.client.get('/follow-qualities?id=9&t=secret')
+        self.assertEqual(offline.json(), {'qualities': [], 'size': len(body)})
+        self.assertEqual(requests, ['GET'])
+
     async def test_follow_qualities_reports_no_size_when_upstream_refuses_the_head(self):
         """字节数取不到不是错误：清晰度照给，`size` 给 None。
 
@@ -3518,13 +3617,116 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         con.commit()
         con.close()
         with patch.object(self.app.state.transcode_service, 'requires_conversion', return_value=True), \
+                patch.object(self.app.state.transcode_service, 'original_playable', return_value=True), \
                 patch.object(self.app.state.transcode_service, 'browser_path',
                              side_effect=AssertionError('whole movie conversion')):
             response = await self.client.get('/api/stream-plan?id=1&session=s&t=secret')
             self.assertEqual(response.json()['protocol'], 'hls')
+            self.assertEqual(response.json()['original_src'], '/stream?id=1&original=1&session=s')
+            self.assertEqual(response.json()['original_mime_type'], 'video/mp4')
             playlist = await self.client.get('/stream/hls/1/index.m3u8?session=s&t=secret')
             self.assertEqual(playlist.status_code, 200)
             self.assertIn('#EXTINF:0.280', playlist.text)
+
+    async def test_original_stream_bypasses_browser_transcoding(self):
+        """原画试播要真正读原文件；兼容性转码只能由回退请求触发。"""
+        with patch.object(self.app.state.transcode_service, 'browser_path',
+                          side_effect=AssertionError('original trial started transcoding')):
+            response = await self.client.get(
+                '/stream?id=1&original=1&session=original-trial',
+                headers={'X-Token': 'secret', 'Range': 'bytes=0-3'},
+            )
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response.content, b'0123')
+        self.assertEqual(response.headers['content-type'], 'video/mp4')
+        self.assertNotIn('x-peach-transcoded', response.headers)
+
+    async def test_mkv_plan_tries_original_then_remux_and_explicit_video_conversion(self):
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "aac")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=mkv&t=secret")).json()
+            self.assertEqual(plan["original_mime_type"], "video/x-matroska")
+            self.assertEqual(plan["processing"], "copy")
+            self.assertEqual(plan["segments"], 2)
+            self.assertIn("transcode=1", plan["fallback_src"])
+            playlist = await self.client.get(plan["fallback_src"] + "&t=secret")
+            self.assertIn("#EXTINF:6.000,", playlist.text)
+            self.assertIn("&transcode=1", playlist.text)
+            original = await self.client.get(plan["original_src"] + "&t=secret", headers={"Range": "bytes=0-3"})
+            self.assertEqual(original.status_code, 206)
+            self.assertEqual(original.headers["content-type"], "video/x-matroska")
+
+    async def test_mkv_with_a_silent_audio_track_skips_the_original_trial(self):
+        """AC-3 这类音轨浏览器静音照放、不报错，回退触发不了：不给原文件地址，直接走分片。"""
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "ac3")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=ac3&t=secret")).json()
+        self.assertEqual((plan["protocol"], plan["processing"]), ("hls", "audio"))
+        self.assertNotIn("original_src", plan)
+
+    async def test_original_trial_without_segments_falls_back_to_whole_file_conversion(self):
+        """时长拿不到切不了分片时，先试原文件，回退地址是原来那条整片转换。"""
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=NULL WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "aac")):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=nodur&t=secret")).json()
+        self.assertEqual(plan["protocol"], "range")
+        self.assertEqual(plan["src"], "/stream?id=1&original=1&session=nodur")
+        self.assertEqual(plan["mime_type"], "video/x-matroska")
+        self.assertEqual((plan["fallback_src"], plan["fallback_mime_type"]), ("/stream?id=1&session=nodur", "video/mp4"))
+
+    async def test_mkv_audio_conversion_and_forced_video_conversion_reach_the_segment_service(self):
+        from unittest.mock import AsyncMock
+        from peach.transcodes import _MediaProfile
+        from peach.ffmpeg import BinaryChoice
+        from support.mkv import minimal_mkv
+
+        source = self.media_root / "clip.mkv"
+        source.write_bytes(minimal_mkv())
+        segment = self.media_root / "slice.ts"
+        segment.write_bytes(b"transport stream")
+        with closing(sqlite3.connect(self.db)) as connection, connection:
+            connection.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(source),))
+        service = self.app.state.transcode_service
+        generate = AsyncMock(return_value=segment)
+        with patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                patch.object(service, "_probe", return_value=_MediaProfile("h264", "yuv420p", "dts")), \
+                patch.object(self.app.state.hls_service, "generate", generate):
+            plan = (await self.client.get("/api/stream-plan?id=1&session=mkv&t=secret")).json()
+            self.assertEqual(plan["processing"], "audio")
+            response = await self.client.get("/stream/hls/1/0.ts?session=mkv&t=secret")
+            self.assertEqual(response.content, b"transport stream")
+            self.assertTrue(generate.call_args.kwargs["audio_transcode"])
+            self.assertNotIn("transcode", generate.call_args.kwargs)
+            await self.client.get("/stream/hls/1/0.ts?session=mkv&transcode=1&t=secret")
+            self.assertTrue(generate.call_args.kwargs["transcode"])
+            self.assertNotIn("audio_transcode", generate.call_args.kwargs)
 
     async def test_unknown_ledger_duration_still_slices_by_the_probed_duration(self):
         """账本没记时长（或记成 -1）的 HEVC MP4 也按片切：时长取 ffprobe 报的，不走整片转码。"""
@@ -3567,6 +3769,32 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
                 service._native_profiles.clear()
                 plain = (await self.client.get("/api/stream-plan?id=1&session=s&t=secret")).json()
                 self.assertEqual(plain["protocol"], "hls")
+
+    async def test_transport_stream_with_h264_is_remuxed_without_reporting_capabilities(self):
+        """`.ts` 里是 H.264：不报解码能力也走整片换封装（Range），HEVC 没报能力仍走转码分片。"""
+        ts = self.media_root / "recording.ts"
+        ts.write_bytes(b"ts-source")
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "INSERT INTO asset(id,location,path,name,medium,size,duration,first_seen) "
+            "VALUES(4,'local',?,'recording.ts','video',9,13.5,'2026-08-15')",
+            (str(ts),),
+        )
+        con.commit()
+        con.close()
+        from peach.ffmpeg import BinaryChoice
+        from peach.transcodes import _MediaProfile
+        service = self.app.state.transcode_service
+        cases = (("h264", "range", "remux"), ("hevc", "hls", None))
+        for codec, protocol, reason in cases:
+            with self.subTest(codec=codec), \
+                    patch.object(service.resolver, "ffprobe", return_value=BinaryChoice(Path("ffprobe"), "test")), \
+                    patch.object(service, "_probe", return_value=_MediaProfile(codec, "yuv420p", "aac", 13.5)):
+                service._native_profiles.clear()
+                plan = (await self.client.get("/api/stream-plan?id=4&session=s&t=secret")).json()
+                self.assertEqual(plan["protocol"], protocol)
+                if reason:
+                    self.assertEqual((plan["reason"], plan["src"]), (reason, "/stream?id=4&session=s"))
 
     async def test_unprobeable_file_without_duration_gets_range_and_a_404_playlist(self):
         """moov 缺失的文件 ffprobe 读不出、账本也没时长：计划回 Range，播放列表回 404，不是 500。"""
@@ -3673,17 +3901,22 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         con.execute("UPDATE asset SET path=?, duration=13.5 WHERE id=1", (str(self.hls_file),))
         con.commit()
         con.close()
+        from peach.transcodes import _MediaProfile
         service = self.app.state.transcode_service
         asked: list[int] = []
 
         with patch.object(service, "requires_conversion", return_value=True), \
                 patch.object(service, "decode_order_timestamps", return_value=True), \
+                patch.object(service, "_profile_for", return_value=_MediaProfile(
+                    "h264", "yuv420p", "aac", 13.5, decode_order_timestamps=True)), \
                 patch.object(self.app.state.header_repairs, "lookup", return_value=None), \
                 patch.object(self.app.state.header_repairs, "request",
                              new=lambda asset_id, source: asked.append(asset_id)):
             plan = (await self.client.get("/api/stream-plan?id=1&session=s&t=secret")).json()
 
         self.assertEqual(plan["protocol"], "hls")
+        self.assertNotIn("original_src", plan)
+        self.assertEqual(plan["processing"], "transcode")
         self.assertEqual(asked, [1])
 
     async def test_transcoded_stream_has_browser_mime_and_marker(self):
@@ -3952,6 +4185,29 @@ class FastApiContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any((self.cover_root.parent / "cover-thumbs").iterdir()))
         full = await self.client.get("/cover?code=ABC-123", headers=headers)
         self.assertEqual(full.content, source.read_bytes())
+
+    async def test_the_front_image_is_served_beside_the_cover_with_its_own_tiers(self):
+        """装好的 DMM 竖版正封走 `/cover?front=1`，派生档不和横图那一份共用文件。"""
+        from PIL import Image
+
+        front = self.cover_root / "front" / "ABC-125.jpg"
+        front.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (2400, 1620), (200, 120, 90)).save(self.cover_root / "ABC-125.jpg", "JPEG")
+        Image.new("RGB", (1536, 2184), (20, 120, 190)).save(front, "JPEG")
+        headers = {"X-Token": "secret"}
+        original = await self.client.get("/cover?front=1&code=ABC-125", headers=headers)
+        self.assertEqual(original.content, front.read_bytes())
+        tier = await self.client.get("/cover?front=1&code=ABC-125&thumb=2", headers=headers)
+        cover_tier = await self.client.get("/cover?code=ABC-125&thumb=2", headers=headers)
+        with Image.open(io.BytesIO(tier.content)) as derived:
+            self.assertEqual(derived.size, (563, 800))
+        with Image.open(io.BytesIO(cover_tier.content)) as derived:
+            self.assertEqual(derived.size, (800, 540))
+        missing = await self.client.get("/cover?front=1&code=ABC-126", headers=headers)
+        self.assertEqual(missing.status_code, 404)
+        Image.new("RGB", (800, 540)).save(self.cover_root / "ABC-127.jpg", "JPEG")
+        unfronted = await self.client.get("/cover?front=1&code=ABC-127", headers=headers)
+        self.assertEqual(unfronted.status_code, 404)
 
     async def test_the_card_start_tier_is_an_800_edge_webp_next_to_the_grid_tier(self):
         """卡片起始档 `/cover?thumb=2` 长边 800，和 1600 那一档同目录、按长边各成一个文件。
